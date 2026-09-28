@@ -10,7 +10,8 @@ Log analysis: [`tools/analyze_logs.py`](tools/analyze_logs.py)
 | Step | BUY (Rally-Base-Rally) | SELL (Drop-Base-Drop) |
 |---|---|---|
 | Trend filter | MA 200 on each enabled timeframe (M20 by default, SMA on close) | same |
-| **PHASE 1** | A candle closes above the MA after the previous candle closed below it | A candle closes below the MA after the previous candle closed above it |
+| **PHASE 1** (MA cross, default) | A candle closes above the MA after the previous candle closed below it | A candle closes below the MA after the previous candle closed above it |
+| **PHASE 1** (BOS option) | Bullish break of structure: a candle closes above the last swing high | Bearish break of structure: a candle closes below the last swing low |
 | **PHASE 2** | After the cross, three closed candles form **Rally → Base → Rally**: bullish, bearish, bullish, each rally longer than the base | After the cross, three closed candles form **Drop → Base → Drop**: bearish, bullish, bearish, each drop longer than the base |
 | Size filter | Both rallies bigger than the average candle size of the 20 candles before the pattern | Both drops bigger than the average candle size of the 20 candles before the pattern |
 | Zone | Base candle body: open (top) to close (bottom) | Base candle body: close (top) to open (bottom) |
@@ -35,6 +36,11 @@ Every enabled timeframe runs the strategy on its own, and buy and sell setups ar
 | Use ALL timeframes | false | Run on all 21 MT5 timeframes (M1 … MN1), ignoring the list |
 | M1 … MN1 | only M20 on | Tick each timeframe to trade. Each one has its own phases, orders and magic number |
 | MA period / method / price | 200 / SMA / Close | Trend MA |
+| Look for setups after | MA cross | **MA cross**, **Break of structure (BOS)**, or **BOS on the right side of the MA** (bullish BOS only counts if it closes above the MA, bearish below) |
+| BOS: swing strength | 3 | A swing high is a high higher than the 3 candles on each side (swing low: mirror) |
+| BOS: lookback | 100 | Candles searched back for the most recent swing high/low |
+| BOS: break by close | true | The BOS candle must close beyond the swing. `false` = a wick through it is enough |
+| BOS: draw level | true | Draws the broken swing level (green = bullish, red = bearish dashed line) |
 | Trade direction | Both | Both, buy only (RBR) or sell only (DBD) |
 | Candle length measured by | Body | Body (open–close) or full range (high–low) for the rally/drop > base comparison |
 | Both rallies/drops longer than base | true | `false` = only one needs to be longer |
@@ -42,14 +48,14 @@ Every enabled timeframe runs the strategy on its own, and buy and sell setups ar
 | Rallies/drops above average candle size | true | Turn the sideways-market filter on or off |
 | Average period | 20 | Number of candles before the pattern used for the average |
 | Average multiplier | 1.0 | Rally/drop must be bigger than average × this (e.g. 1.5 = 50% bigger) |
-| Reset PHASE 1 on close across MA | true | Start over if price closes back across the MA (below for buys, above for sells) |
+| Reset PHASE 1 when the trigger breaks | true | MA mode: price closes back across the MA. BOS mode: an opposite BOS. BOS + MA mode: either |
 | Keep looking for more setups after an order | false | `false` = one order per MA cross. `true` = after an order is placed, keep looking for the next RBR/DBD until PHASE 1 resets (close back across the MA) or a new cross |
 | Max orders per MA cross | 0 | Limit for the option above (0 = no limit). E.g. 2 = first and second setup only |
 | Limit order price | Near edge | Near edge (base open), middle, or far edge (base close) |
 | Reward:Risk | 5.0 | TP = entry ± 5 × distance from entry to SL |
 | SL buffer (points) | 0 | Extra distance below the base low (buys) / above the base high (sells) |
 | Cancel pending after N bars | 0 | 0 = never expire |
-| Cancel pending on close across MA | true | Delete an unfilled buy limit on a close below the MA, or a sell limit on a close above it |
+| Cancel pending when the trigger breaks | true | Same rule as the reset: MA close across and/or opposite BOS deletes the unfilled limit order |
 | Lot mode | Fixed | Fixed lot or % of balance risked |
 | Fixed lots / Risk % | 0.10 / 1.0 | |
 | Base magic number | 20020 | Each timeframe uses base + its index: M1 = 20020, M20 = 20029, H1 = 20031, D1 = 20038, MN1 = 20040 |
@@ -61,6 +67,18 @@ Every enabled timeframe runs the strategy on its own, and buy and sell setups ar
 | Log file name prefix | RBR | |
 
 The chart shows the phases of every enabled timeframe, the closed trade count and the last event in the top-left corner, and draws RBR zones as blue rectangles and DBD zones as red rectangles.
+
+## Break of structure (BOS)
+
+- **Swing high**: a candle whose high is higher than the highs of the *swing strength* candles on each side. It is
+  confirmed only when those candles on its right have closed, so the swing never uses the breaking candle.
+- **Bullish BOS**: the last closed candle is the **first** candle to close above the most recent confirmed swing
+  high. A swing is only broken once, so each break gives one BOS.
+- **Bearish BOS**: the mirror, a close below the most recent confirmed swing low.
+- After a bullish BOS the EA looks for a Rally-Base-Rally (buy); after a bearish BOS a Drop-Base-Drop (sell). The
+  BOS candle can be the first rally/drop (same input as for the MA cross). A bearish BOS resets the buy side and
+  cancels its unfilled buy limit; a bullish BOS does the same for sells.
+- BOS events are written to the candles log (`events` column) and the trigger settings to `_settings.csv`.
 
 ## CSV logs
 

@@ -24,7 +24,7 @@
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "2.10"
+#property version   "2.20"
 #property description "MA200 trend filter + Rally-Base-Rally / Drop-Base-Drop limit orders on any set of timeframes, with CSV logging"
 
 #include <Trade/Trade.mqh>
@@ -66,9 +66,16 @@ enum ENUM_TRADE_SCOPE
    SCOPE_GLOBAL = 1  // Across all timeframes
   };
 
+enum ENUM_SETUP_TRIGGER
+  {
+   TRIGGER_MA_CROSS = 0, // MA cross
+   TRIGGER_BOS      = 1, // Break of structure (BOS)
+   TRIGGER_BOS_MA   = 2  // BOS on the right side of the MA
+  };
+
 enum ENUM_PHASE
   {
-   PHASE_WAIT_CROSS   = 0, // waiting for PHASE 1 (cross of the MA)
+   PHASE_WAIT_CROSS   = 0, // waiting for PHASE 1 (MA cross or BOS)
    PHASE_WAIT_PATTERN = 1  // PHASE 1 passed, waiting for PHASE 2 (RBR / DBD)
   };
 
@@ -76,7 +83,7 @@ enum ENUM_PHASE
 struct SetupState
   {
    ENUM_PHASE phase;
-   datetime   crossTime;
+   datetime   crossTime;    // time of the PHASE 1 candle (MA cross or BOS)
    int        orders;       // orders placed since the cross
   };
 
@@ -151,11 +158,18 @@ input ENUM_MA_METHOD       InpMAMethod   = MODE_SMA;     // MA method
 input ENUM_APPLIED_PRICE   InpMAPrice    = PRICE_CLOSE;  // MA applied price
 input ENUM_TRADE_DIRECTION InpDirection  = DIR_BOTH;     // Trade direction
 
+input group "PHASE 1 trigger"
+input ENUM_SETUP_TRIGGER InpTrigger          = TRIGGER_MA_CROSS; // Look for setups after
+input int                InpSwingStrength    = 3;                // BOS: swing = highest high / lowest low of N candles each side
+input int                InpBOSLookback      = 100;              // BOS: candles searched for the last swing high/low
+input bool               InpBOSBreakByClose  = true;             // BOS: candle must CLOSE beyond the swing (false = wick is enough)
+input bool               InpDrawBOS          = true;             // BOS: draw the broken swing level on the chart
+
 input group "Rally-Base-Rally / Drop-Base-Drop"
 input ENUM_CANDLE_SIZE   InpSizeMode             = SIZE_BODY; // Candle length measured by
 input bool               InpBothLegsLonger       = true;      // Both rallies/drops longer than base (false = either one)
 input bool               InpAllowCrossAsLeg      = true;      // Cross candle may be the first rally/drop
-input bool               InpResetOnCloseAcrossMA = true;      // Reset PHASE 1 if a candle closes back across the MA
+input bool               InpResetOnCloseAcrossMA = true;      // Reset PHASE 1 when the trigger breaks (MA: close back across, BOS: opposite BOS)
 input bool               InpMultipleSetups       = false;     // Keep looking for more setups after an order (until PHASE 1 resets)
 input int                InpMaxSetupsPerCross    = 0;         // Max orders per MA cross when the above is on (0 = no limit)
 
@@ -169,7 +183,7 @@ input ENUM_ENTRY_LEVEL   InpEntryLevel            = ENTRY_ZONE_NEAR; // Limit or
 input double             InpRewardRisk            = 5.0;             // Reward:Risk (TP = RR x risk)
 input int                InpSLBufferPoints        = 0;               // Extra SL buffer beyond the base low/high (points)
 input int                InpExpiryBars            = 0;               // Cancel pending after N bars of its timeframe (0 = never)
-input bool               InpCancelOnCloseAcrossMA = true;            // Cancel pending if a candle closes across the MA against it
+input bool               InpCancelOnCloseAcrossMA = true;            // Cancel pending when the trigger breaks (MA: close across, BOS: opposite BOS)
 
 input group "Money management"
 input ENUM_LOT_MODE      InpLotMode     = LOT_FIXED; // Lot mode
@@ -224,10 +238,10 @@ const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,clos
 int OnInit()
   {
    if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0 ||
-      InpMaxSetupsPerCross < 0)
+      InpMaxSetupsPerCross < 0 || InpSwingStrength < 1 || InpBOSLookback < InpSwingStrength + 3)
      {
       Print("Invalid inputs: MA period and average period must be >= 1, Reward:Risk and average multiplier > 0, " +
-            "max setups per cross >= 0");
+            "max setups per cross >= 0, swing strength >= 1, BOS lookback >= swing strength + 3");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -345,7 +359,10 @@ bool ProcessTimeframe(TFContext &c)
 
    //--- closed candles: [1] = last closed, [2], [3] = before it,
    //--- [4] .. [3 + InpAvgSizePeriod] = candles used for the average size
+   //--- BOS mode also needs enough candles to find the last swing high / low
    int barsNeeded = 4 + InpAvgSizePeriod;
+   if(InpTrigger != TRIGGER_MA_CROSS)
+      barsNeeded = MathMax(barsNeeded, InpBOSLookback + InpSwingStrength + 2);
 
    //--- not enough history for the MA on this timeframe (e.g. MN1 with MA200)
    if(Bars(_Symbol, c.tf) < InpMAPeriod + barsNeeded)
@@ -374,49 +391,100 @@ bool ProcessTimeframe(TFContext &c)
    bool closedBelowMA = rates[1].close < ma[1];
    bool closedAboveMA = rates[1].close > ma[1];
 
+   //--- break of structure on the last closed candle
+   bool     useBOS = InpTrigger != TRIGGER_MA_CROSS;
+   bool     useMA  = InpTrigger != TRIGGER_BOS;
+   bool     bullBOS = false, bearBOS = false;
+   double   bullLevel = 0.0, bearLevel = 0.0;
+   datetime bullSwing = 0,   bearSwing = 0;
+   if(useBOS)
+     {
+      bullBOS = FindBOS(rates, barsNeeded, true,  bullLevel, bullSwing);
+      bearBOS = FindBOS(rates, barsNeeded, false, bearLevel, bearSwing);
+      if(bullBOS)
+         AddEvent(c, "bullish BOS: closed above swing high " + DoubleToString(bullLevel, _Digits));
+      if(bearBOS)
+         AddEvent(c, "bearish BOS: closed below swing low " + DoubleToString(bearLevel, _Digits));
+      if(InpDrawBOS && (InpDrawAllTFZones || c.tf == Period()))
+        {
+         if(bullBOS)
+            DrawBOS(c, true, bullSwing, rates[1].time, bullLevel);
+         if(bearBOS)
+            DrawBOS(c, false, bearSwing, rates[1].time, bearLevel);
+        }
+     }
+
+   //--- the buy (sell) idea is broken by a close below (above) the MA and/or a bearish (bullish) BOS
+   bool   buyBroken   = (useMA && closedBelowMA) || (useBOS && bearBOS);
+   bool   sellBroken  = (useMA && closedAboveMA) || (useBOS && bullBOS);
+   string buyReason   = (useBOS && bearBOS) ? "BEARISH_BOS" : "CLOSE_BELOW_MA";
+   string sellReason  = (useBOS && bullBOS) ? "BULLISH_BOS" : "CLOSE_ABOVE_MA";
+
    //--- cancel pending orders when the trend is lost
    if(InpCancelOnCloseAcrossMA)
      {
-      if(closedBelowMA)
-         DeletePendingOrders(c, ORDER_TYPE_BUY_LIMIT, "CLOSE_BELOW_MA");
-      if(closedAboveMA)
-         DeletePendingOrders(c, ORDER_TYPE_SELL_LIMIT, "CLOSE_ABOVE_MA");
+      if(buyBroken)
+         DeletePendingOrders(c, ORDER_TYPE_BUY_LIMIT, buyReason);
+      if(sellBroken)
+         DeletePendingOrders(c, ORDER_TYPE_SELL_LIMIT, sellReason);
      }
 
-   //--- reset PHASE 1 when price closes back across the MA
+   //--- reset PHASE 1 when the trigger breaks
    if(InpResetOnCloseAcrossMA)
      {
-      if(c.buy.phase == PHASE_WAIT_PATTERN && closedBelowMA)
+      if(c.buy.phase == PHASE_WAIT_PATTERN && buyBroken)
         {
          c.buy.phase = PHASE_WAIT_CROSS;
-         AddEvent(c, "BUY PHASE 1 reset (closed back below MA)");
+         AddEvent(c, "BUY PHASE 1 reset (" + buyReason + ")");
         }
-      if(c.sell.phase == PHASE_WAIT_PATTERN && closedAboveMA)
+      if(c.sell.phase == PHASE_WAIT_PATTERN && sellBroken)
         {
          c.sell.phase = PHASE_WAIT_CROSS;
-         AddEvent(c, "SELL PHASE 1 reset (closed back above MA)");
+         AddEvent(c, "SELL PHASE 1 reset (" + sellReason + ")");
         }
      }
 
-   //--- PHASE 1 BUY: first close above MA coming from below
-   if(BuysAllowed() && rates[2].close < ma[2] && closedAboveMA)
+   //--- PHASE 1 triggers
+   bool   buyTrigger  = false;
+   bool   sellTrigger = false;
+   string trigName    = "";
+   switch(InpTrigger)
+     {
+      case TRIGGER_BOS:
+         buyTrigger  = bullBOS;
+         sellTrigger = bearBOS;
+         trigName    = "BOS";
+         break;
+      case TRIGGER_BOS_MA:
+         buyTrigger  = bullBOS && closedAboveMA;
+         sellTrigger = bearBOS && closedBelowMA;
+         trigName    = "BOS with MA";
+         break;
+      default:
+         //--- first close above (below) the MA coming from below (above)
+         buyTrigger  = rates[2].close < ma[2] && closedAboveMA;
+         sellTrigger = rates[2].close > ma[2] && closedBelowMA;
+         trigName    = "MA cross";
+         break;
+     }
+
+   if(BuysAllowed() && buyTrigger)
      {
       c.buy.phase     = PHASE_WAIT_PATTERN;
       c.buy.crossTime = rates[1].time;
       c.buy.orders    = 0;
-      AddEvent(c, "BUY PHASE 1 passed - waiting for Rally-Base-Rally");
+      AddEvent(c, "BUY PHASE 1 passed (" + trigName + ") - waiting for Rally-Base-Rally");
      }
 
-   //--- PHASE 1 SELL: first close below MA coming from above
-   if(SellsAllowed() && rates[2].close > ma[2] && closedBelowMA)
+   if(SellsAllowed() && sellTrigger)
      {
       c.sell.phase     = PHASE_WAIT_PATTERN;
       c.sell.crossTime = rates[1].time;
       c.sell.orders    = 0;
-      AddEvent(c, "SELL PHASE 1 passed - waiting for Drop-Base-Drop");
+      AddEvent(c, "SELL PHASE 1 passed (" + trigName + ") - waiting for Drop-Base-Drop");
      }
 
-   //--- PHASE 2: pattern after the cross
+   //--- PHASE 2: pattern after the trigger
    if(BuysAllowed() && c.buy.phase == PHASE_WAIT_PATTERN)
       CheckPattern(rates, c, true);
    if(SellsAllowed() && c.sell.phase == PHASE_WAIT_PATTERN)
@@ -915,6 +983,71 @@ void ReleaseHandles()
         }
   }
 
+//+------------------------------------------------------------------+
+//| Break of structure                                               |
+//+------------------------------------------------------------------+
+//--- swing high (isHigh) / swing low at series index j: the extreme of N candles on each side
+bool IsSwing(const MqlRates &r[], int j, int n, bool isHigh)
+  {
+   for(int k = 1; k <= n; k++)
+     {
+      if(isHigh)
+        {
+         if(r[j].high < r[j - k].high || r[j].high <= r[j + k].high)
+            return false;
+        }
+      else
+        {
+         if(r[j].low > r[j - k].low || r[j].low >= r[j + k].low)
+            return false;
+        }
+     }
+   return true;
+  }
+
+bool BreaksLevel(const MqlRates &bar, double level, bool up)
+  {
+   if(InpBOSBreakByClose)
+      return up ? bar.close > level : bar.close < level;
+   return up ? bar.high > level : bar.low < level;
+  }
+
+//--- bullish BOS: the last closed candle [1] is the FIRST to break the most recent
+//--- confirmed swing high (confirmed by N candles before [1]). Bearish is the mirror.
+bool FindBOS(const MqlRates &r[], int count, bool bullish, double &level, datetime &swingTime)
+  {
+   int n    = InpSwingStrength;
+   int maxJ = MathMin(InpBOSLookback, count - n - 1);
+   for(int j = n + 2; j <= maxJ; j++)
+     {
+      if(!IsSwing(r, j, n, bullish))
+         continue;
+      level     = bullish ? r[j].high : r[j].low;
+      swingTime = r[j].time;
+      if(!BreaksLevel(r[1], level, bullish))
+         return false;
+      for(int k = 2; k < j; k++)
+         if(BreaksLevel(r[k], level, bullish))
+            return false;   // already broken earlier - not a new BOS
+      return true;
+     }
+   return false;
+  }
+
+void DrawBOS(const TFContext &c, bool bullish, datetime swingTime, datetime breakTime, double level)
+  {
+   string name = OBJ_PREFIX + c.name + "_BOS_" + (bullish ? "UP_" : "DN_") + TimeToString(breakTime, TIME_DATE | TIME_MINUTES);
+   ObjectDelete(0, name);
+   if(ObjectCreate(0, name, OBJ_TREND, 0, swingTime, level, breakTime, level))
+     {
+      ObjectSetInteger(0, name, OBJPROP_COLOR, bullish ? clrLimeGreen : clrRed);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+      ObjectSetString(0, name, OBJPROP_TOOLTIP, c.name + (bullish ? " bullish" : " bearish") + " BOS " +
+                      DoubleToString(level, _Digits));
+     }
+  }
+
 bool BuysAllowed()  { return InpDirection != DIR_SELL_ONLY; }
 bool SellsAllowed() { return InpDirection != DIR_BUY_ONLY;  }
 
@@ -1021,9 +1154,9 @@ string PhaseText(bool isBuy, const TFContext &c)
    ENUM_PHASE phase = isBuy ? c.buy.phase : c.sell.phase;
    datetime   cross = isBuy ? c.buy.crossTime : c.sell.crossTime;
    if(phase == PHASE_WAIT_CROSS)
-      return "wait cross";
+      return InpTrigger == TRIGGER_MA_CROSS ? "wait cross" : (isBuy ? "wait bullish BOS" : "wait bearish BOS");
    int orders = isBuy ? c.buy.orders : c.sell.orders;
-   return "wait " + (isBuy ? "RBR" : "DBD") + " (cross " + TimeToString(cross, TIME_DATE | TIME_MINUTES) +
+   return "wait " + (isBuy ? "RBR" : "DBD") + " (" + (InpTrigger == TRIGGER_MA_CROSS ? "cross " : "BOS ") + TimeToString(cross, TIME_DATE | TIME_MINUTES) +
           (orders > 0 ? ", " + (string)orders + " placed" : "") + ")";
   }
 
@@ -1153,6 +1286,10 @@ void WriteSettingsFile()
    WriteLine(h, "ma_method," + EnumToString(InpMAMethod));
    WriteLine(h, "ma_price," + EnumToString(InpMAPrice));
    WriteLine(h, "direction," + EnumToString(InpDirection));
+   WriteLine(h, "trigger," + EnumToString(InpTrigger));
+   WriteLine(h, "swing_strength," + (string)InpSwingStrength);
+   WriteLine(h, "bos_lookback," + (string)InpBOSLookback);
+   WriteLine(h, "bos_break_by_close," + (string)InpBOSBreakByClose);
    WriteLine(h, "size_mode," + EnumToString(InpSizeMode));
    WriteLine(h, "both_legs_longer," + (string)InpBothLegsLonger);
    WriteLine(h, "allow_cross_as_leg," + (string)InpAllowCrossAsLeg);
