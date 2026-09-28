@@ -55,6 +55,11 @@ input bool               InpBothRalliesLonger   = true;      // Both rallies lon
 input bool               InpAllowCrossAsRally   = true;      // Cross candle may be the first rally
 input bool               InpResetOnCloseBelowMA = true;      // Reset PHASE 1 if a candle closes back below MA
 
+input group "Average candle size filter (avoid sideways markets)"
+input bool               InpUseAvgSizeFilter    = true;      // Rallies must be above average candle size
+input int                InpAvgSizePeriod       = 20;        // Candles used for the average (before the pattern)
+input double             InpAvgSizeMultiplier   = 1.0;       // Rally size must exceed average x this
+
 input group "Order"
 input ENUM_ENTRY_LEVEL   InpEntryLevel           = ENTRY_ZONE_TOP; // Buy limit price
 input double             InpRewardRisk           = 5.0;            // Reward:Risk (TP = RR x risk)
@@ -86,9 +91,9 @@ const string OBJ_PREFIX  = "RBR_MA200_";
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   if(InpMAPeriod < 1 || InpRewardRisk <= 0.0)
+   if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0)
      {
-      Print("Invalid inputs: MA period must be >= 1 and Reward:Risk > 0");
+      Print("Invalid inputs: MA period and average period must be >= 1, Reward:Risk and average multiplier > 0");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -125,13 +130,15 @@ void OnTick()
    if(!IsNewBar())
       return;
 
-   //--- closed candles: [1] = last closed, [2], [3] = before it
+   //--- closed candles: [1] = last closed, [2], [3] = before it,
+   //--- [4] .. [3 + InpAvgSizePeriod] = candles used for the average size
+   int      barsNeeded = 4 + InpAvgSizePeriod;
    MqlRates rates[];
    double   ma[];
    ArraySetAsSeries(rates, true);
    ArraySetAsSeries(ma, true);
 
-   if(CopyRates(_Symbol, InpTimeframe, 0, 4, rates) < 4)
+   if(CopyRates(_Symbol, InpTimeframe, 0, barsNeeded, rates) < barsNeeded)
       return;
    if(CopyBuffer(g_maHandle, 0, 0, 4, ma) < 4)
       return;
@@ -188,6 +195,20 @@ void CheckRallyBaseRally(const MqlRates &rates[])
    bool sizeOk     = InpBothRalliesLonger ? (r1Longer && r2Longer) : (r1Longer || r2Longer);
    if(!sizeOk)
       return;
+
+   //--- rallies must be bigger than the average candle: skips choppy, sideways markets
+   if(InpUseAvgSizeFilter)
+     {
+      double avgSize  = AverageCandleSize(rates, 4, InpAvgSizePeriod);
+      double minRally = avgSize * InpAvgSizeMultiplier;
+      if(CandleSize(rally1) <= minRally || CandleSize(rally2) <= minRally)
+        {
+         g_lastEvent = "RBR ignored: rallies not above average size (" +
+                       DoubleToString(minRally, _Digits) + ")";
+         Print(g_lastEvent);
+         return;
+        }
+     }
 
    //--- base zone: open (top) to close (bottom) of the bearish base candle
    double zoneTop    = base.open;
@@ -281,6 +302,14 @@ bool IsBearish(const MqlRates &r) { return r.close < r.open; }
 double CandleSize(const MqlRates &r)
   {
    return (InpSizeMode == SIZE_BODY) ? MathAbs(r.close - r.open) : (r.high - r.low);
+  }
+
+double AverageCandleSize(const MqlRates &rates[], int start, int count)
+  {
+   double sum = 0.0;
+   for(int i = start; i < start + count; i++)
+      sum += CandleSize(rates[i]);
+   return sum / count;
   }
 
 double NormalizePrice(double price)

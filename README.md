@@ -11,6 +11,7 @@ File: [`Experts/RBR_MA200_EA.mq5`](Experts/RBR_MA200_EA.mq5)
 | Trend filter | MA 200 on the M20 timeframe (SMA on close by default) |
 | **PHASE 1** | A candle closes above the MA after the previous candle closed below it (first close above, coming from below) |
 | **PHASE 2** | After the cross, three closed candles form **Rally → Base → Rally**: bullish, bearish, bullish, and each rally is longer than the base |
+| Size filter | Both rallies must be bigger than the average candle size of the 20 candles before the pattern, so small candles in sideways markets are ignored |
 | Zone | Base candle open (top) to close (bottom) |
 | Entry | Buy limit at the zone, placed only if price has not already come back to the zone |
 | Stop loss | Below the base candle's low |
@@ -35,6 +36,9 @@ After a buy limit is placed, the EA goes back to waiting for a new PHASE 1 cross
 | Candle length measured by | Body | Body (open–close) or full range (high–low) for the rally > base comparison |
 | Both rallies longer than base | true | `false` = only one rally needs to be longer |
 | Cross candle may be the first rally | true | Allow the cross candle to be the first Rally |
+| Rallies above average candle size | true | Turn the sideways-market filter on or off |
+| Average period | 20 | Number of candles before the pattern used for the average |
+| Average multiplier | 1.0 | Rally must be bigger than average × this (e.g. 1.5 = 50% bigger) |
 | Reset PHASE 1 on close below MA | true | Start over if price closes back below the MA |
 | Buy limit price | Zone top | Zone top (base open), middle, or bottom (base close) |
 | Reward:Risk | 5.0 | TP = entry + 5 × (entry − SL) |
