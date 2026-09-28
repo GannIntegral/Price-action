@@ -149,6 +149,14 @@ def main():
                 by_no["#%d" % n if n < 4 else "#4+"].append(r)
             print_table("== Results by setup number after the MA cross ==", head, stats_rows(dict(sorted(by_no.items()))))
 
+        #--- BOS mode: the RBR/DBD that caused the BOS vs new ones formed after it
+        sources = {r.get("setup_source") for r in closed} - {None, ""}
+        if "BOS_ORIGIN" in sources:
+            by_src = defaultdict(list)
+            for r in closed:
+                by_src[r.get("setup_source") or "AFTER_TRIGGER"].append(r)
+            print_table("== Results by setup source (BOS_ORIGIN = caused the BOS) ==", head, stats_rows(by_src))
+
     #--- fill rate: how many limit orders were never reached
     fills = defaultdict(Counter)
     for r in trades:

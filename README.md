@@ -40,6 +40,7 @@ Every enabled timeframe runs the strategy on its own, and buy and sell setups ar
 | BOS: swing strength | 3 | A swing high is a high higher than the 3 candles on each side (swing low: mirror) |
 | BOS: lookback | 100 | Candles searched back for the most recent swing high/low |
 | BOS: break by close | true | The BOS candle must close beyond the swing. `false` = a wick through it is enough |
+| BOS: which RBR/DBD to trade | Both | **Both**: the RBR/DBD that caused the BOS, then new ones after it. **Only the one that caused the BOS**. **Only new ones after the BOS** |
 | BOS: draw level | true | Draws the broken swing level (green = bullish, red = bearish dashed line) |
 | Trade direction | Both | Both, buy only (RBR) or sell only (DBD) |
 | Candle length measured by | Body | Body (open–close) or full range (high–low) for the rally/drop > base comparison |
@@ -75,8 +76,14 @@ The chart shows the phases of every enabled timeframe, the closed trade count an
 - **Bullish BOS**: the last closed candle is the **first** candle to close above the most recent confirmed swing
   high. A swing is only broken once, so each break gives one BOS.
 - **Bearish BOS**: the mirror, a close below the most recent confirmed swing low.
-- After a bullish BOS the EA looks for a Rally-Base-Rally (buy); after a bearish BOS a Drop-Base-Drop (sell). The
-  BOS candle can be the first rally/drop (same input as for the MA cross). A bearish BOS resets the buy side and
+- **The RBR that caused the BOS**: on a bullish BOS the EA looks back between the broken swing high and the BOS
+  candle for the most recent Rally-Base-Rally whose zone price has not come back to since (fresh zone). Its base
+  is the demand zone, and the buy limit is placed right away for the pullback. Bearish: the Drop-Base-Drop that
+  broke the swing low.
+- **New RBR/DBD after the BOS**: like the MA cross mode, the EA also waits for a new pattern that forms after the
+  BOS candle (the BOS candle can be the first rally/drop).
+- *BOS: which RBR/DBD to trade* picks one or both. In *Both*, the origin pattern is setup #1 and the next new
+  pattern is setup #2; *Keep looking for more setups* allows more after that. A bearish BOS resets the buy side and
   cancels its unfilled buy limit; a bullish BOS does the same for sells.
 - BOS events are written to the candles log (`events` column) and the trigger settings to `_settings.csv`.
 
@@ -89,7 +96,7 @@ Each run writes a new set of files named `RBR_<symbol>_[TEST_]<date>_<time>_<id>
 | File | One row per | Columns |
 |---|---|---|
 | `_settings.csv` | input | All inputs of the run, so runs with different settings can be compared |
-| `_trades.csv` | limit order | Setup number after the MA cross (1st, 2nd…), timeframe, direction, zone, entry, SL, TP, target RR, lots, money at risk, status (CLOSED / CANCELLED / OPEN_AT_END / PENDING_AT_END), reason (TP, SL, CLOSE_BELOW_MA, EXPIRED…), fill and close time/price, bars to fill, bars held, profit, commission, swap, net, **R multiple**, **MFE R** (best move in its favour, in R), **MAE R** (worst move against it), balance, equity |
+| `_trades.csv` | limit order | Setup number after the MA cross/BOS (1st, 2nd…), setup source (BOS_ORIGIN or AFTER_TRIGGER), timeframe, direction, zone, entry, SL, TP, target RR, lots, money at risk, status (CLOSED / CANCELLED / OPEN_AT_END / PENDING_AT_END), reason (TP, SL, CLOSE_BELOW_MA, EXPIRED…), fill and close time/price, bars to fill, bars held, profit, commission, swap, net, **R multiple**, **MFE R** (best move in its favour, in R), **MAE R** (worst move against it), balance, equity |
 | `_setups.csv` | detected RBR/DBD | Leg and base sizes, average size, zone, entry/SL/TP, and what happened: PLACED, or why it was skipped (SKIP_AVG_SIZE, SKIP_TRADE_OPEN, SKIP_PRICE_IN_ZONE…) |
 | `_candles.csv` | closed candle per timeframe | OHLC, MA, above/below MA, buy and sell phase, balance, equity, open/pending trades on that timeframe, floating P/L, open trade's entry, SL, TP, current R, MFE/MAE, and the events of that candle |
 

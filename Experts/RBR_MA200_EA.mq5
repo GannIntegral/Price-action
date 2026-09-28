@@ -24,7 +24,7 @@
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "2.20"
+#property version   "2.30"
 #property description "MA200 trend filter + Rally-Base-Rally / Drop-Base-Drop limit orders on any set of timeframes, with CSV logging"
 
 #include <Trade/Trade.mqh>
@@ -71,6 +71,13 @@ enum ENUM_SETUP_TRIGGER
    TRIGGER_MA_CROSS = 0, // MA cross
    TRIGGER_BOS      = 1, // Break of structure (BOS)
    TRIGGER_BOS_MA   = 2  // BOS on the right side of the MA
+  };
+
+enum ENUM_BOS_SETUP
+  {
+   BOS_SETUP_BOTH   = 0, // The RBR/DBD that caused the BOS + new ones after it
+   BOS_SETUP_ORIGIN = 1, // Only the RBR/DBD that caused the BOS
+   BOS_SETUP_NEW    = 2  // Only new RBR/DBD that form after the BOS
   };
 
 enum ENUM_PHASE
@@ -123,7 +130,8 @@ struct TradeRec
    double   fillPrice;
    double   mfe;          // max favourable excursion (price distance from fill)
    double   mae;          // max adverse excursion (price distance from fill)
-   int      setupNo;      // 1 = first order after the MA cross, 2 = second, ...
+   int      setupNo;      // 1 = first order after the MA cross / BOS, 2 = second, ...
+   bool     origin;       // true = the RBR/DBD that caused the BOS
    string   cancelReason;
   };
 
@@ -164,6 +172,7 @@ input int                InpSwingStrength    = 3;                // BOS: swing =
 input int                InpBOSLookback      = 100;              // BOS: candles searched for the last swing high/low
 input bool               InpBOSBreakByClose  = true;             // BOS: candle must CLOSE beyond the swing (false = wick is enough)
 input bool               InpDrawBOS          = true;             // BOS: draw the broken swing level on the chart
+input ENUM_BOS_SETUP     InpBOSSetup         = BOS_SETUP_BOTH;   // BOS: which RBR/DBD to trade
 
 input group "Rally-Base-Rally / Drop-Base-Drop"
 input ENUM_CANDLE_SIZE   InpSizeMode             = SIZE_BODY; // Candle length measured by
@@ -230,8 +239,8 @@ bool            g_showComment = true;
 const string OBJ_PREFIX = "RBR_MA200_";
 const string LOG_FOLDER = "RBR_MA200_logs\\";
 
-const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,setup_no";
-const string SETUPS_HEADER = "detected_time,timeframe,direction,pattern,base_time,leg1_points,base_points,leg2_points,avg_points,zone_top,zone_bottom,entry,sl,tp,rr_target,lots,result,setup_no";
+const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,setup_no,setup_source";
+const string SETUPS_HEADER = "detected_time,timeframe,direction,pattern,base_time,leg1_points,base_points,leg2_points,avg_points,zone_top,zone_bottom,entry,sl,tp,rr_target,lots,result,setup_no,setup_source";
 const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,buy_phase,sell_phase,balance,equity,tf_open_trades,tf_pending,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
 
 //+------------------------------------------------------------------+
@@ -362,7 +371,8 @@ bool ProcessTimeframe(TFContext &c)
    //--- BOS mode also needs enough candles to find the last swing high / low
    int barsNeeded = 4 + InpAvgSizePeriod;
    if(InpTrigger != TRIGGER_MA_CROSS)
-      barsNeeded = MathMax(barsNeeded, InpBOSLookback + InpSwingStrength + 2);
+      barsNeeded = MathMax(barsNeeded, MathMax(InpBOSLookback + InpSwingStrength + 2,
+                                               InpBOSLookback + InpAvgSizePeriod + 2));
 
    //--- not enough history for the MA on this timeframe (e.g. MN1 with MA200)
    if(Bars(_Symbol, c.tf) < InpMAPeriod + barsNeeded)
@@ -397,10 +407,11 @@ bool ProcessTimeframe(TFContext &c)
    bool     bullBOS = false, bearBOS = false;
    double   bullLevel = 0.0, bearLevel = 0.0;
    datetime bullSwing = 0,   bearSwing = 0;
+   int      bullIdx   = 0,   bearIdx   = 0;
    if(useBOS)
      {
-      bullBOS = FindBOS(rates, barsNeeded, true,  bullLevel, bullSwing);
-      bearBOS = FindBOS(rates, barsNeeded, false, bearLevel, bearSwing);
+      bullBOS = FindBOS(rates, barsNeeded, true,  bullLevel, bullSwing, bullIdx);
+      bearBOS = FindBOS(rates, barsNeeded, false, bearLevel, bearSwing, bearIdx);
       if(bullBOS)
          AddEvent(c, "bullish BOS: closed above swing high " + DoubleToString(bullLevel, _Digits));
       if(bearBOS)
@@ -474,6 +485,8 @@ bool ProcessTimeframe(TFContext &c)
       c.buy.crossTime = rates[1].time;
       c.buy.orders    = 0;
       AddEvent(c, "BUY PHASE 1 passed (" + trigName + ") - waiting for Rally-Base-Rally");
+      if(useBOS)
+         TradeBOSOrigin(rates, c, true, bullIdx);
      }
 
    if(SellsAllowed() && sellTrigger)
@@ -482,13 +495,15 @@ bool ProcessTimeframe(TFContext &c)
       c.sell.crossTime = rates[1].time;
       c.sell.orders    = 0;
       AddEvent(c, "SELL PHASE 1 passed (" + trigName + ") - waiting for Drop-Base-Drop");
+      if(useBOS)
+         TradeBOSOrigin(rates, c, false, bearIdx);
      }
 
    //--- PHASE 2: pattern after the trigger
    if(BuysAllowed() && c.buy.phase == PHASE_WAIT_PATTERN)
-      CheckPattern(rates, c, true);
+      CheckPattern(rates, c, true, 1, false);
    if(SellsAllowed() && c.sell.phase == PHASE_WAIT_PATTERN)
-      CheckPattern(rates, c, false);
+      CheckPattern(rates, c, false, 1, false);
 
    if(InpLogCandles)
       LogCandle(c, rates[1], ma[1]);
@@ -497,46 +512,93 @@ bool ProcessTimeframe(TFContext &c)
   }
 
 //+------------------------------------------------------------------+
-//| PHASE 2 check on the last three closed candles                   |
+//| RBR (isBuy) / DBD shape with leg2 at series index i:             |
+//| leg1 = [i+2], base = [i+1], leg2 = [i], legs longer than base    |
+//+------------------------------------------------------------------+
+bool IsPatternAt(const MqlRates &rates[], int i, bool isBuy)
+  {
+   //--- RBR: bullish, bearish, bullish   DBD: bearish, bullish, bearish
+   if(isBuy)
+     {
+      if(!IsBullish(rates[i + 2]) || !IsBearish(rates[i + 1]) || !IsBullish(rates[i]))
+         return false;
+     }
+   else
+     {
+      if(!IsBearish(rates[i + 2]) || !IsBullish(rates[i + 1]) || !IsBearish(rates[i]))
+         return false;
+     }
+   double baseSize = CandleSize(rates[i + 1]);
+   bool   l1Longer = CandleSize(rates[i + 2]) > baseSize;
+   bool   l2Longer = CandleSize(rates[i]) > baseSize;
+   return InpBothLegsLonger ? (l1Longer && l2Longer) : (l1Longer || l2Longer);
+  }
+
+//+------------------------------------------------------------------+
+//| On a BOS: find the RBR/DBD that caused it - the most recent one  |
+//| between the broken swing and the BOS candle whose zone price has |
+//| not come back to since - and trade it.                           |
+//+------------------------------------------------------------------+
+void TradeBOSOrigin(const MqlRates &rates[], TFContext &c, bool isBuy, int swingIdx)
+  {
+   if(InpBOSSetup != BOS_SETUP_NEW)
+     {
+      for(int i = 1; i + 1 < swingIdx; i++)
+        {
+         if(!IsPatternAt(rates, i, isBuy))
+            continue;
+         //--- zone must be untouched after the pattern (fresh)
+         MqlRates base  = rates[i + 1];
+         bool     fresh = true;
+         for(int k = i - 1; k >= 1 && fresh; k--)
+            fresh = isBuy ? rates[k].low > MathMax(base.open, base.close)
+                          : rates[k].high < MathMin(base.open, base.close);
+         if(!fresh)
+            continue;
+         CheckPattern(rates, c, isBuy, i, true);
+         break;
+        }
+     }
+
+   //--- origin only: nothing more to wait for after this BOS
+   if(InpBOSSetup == BOS_SETUP_ORIGIN)
+     {
+      if(isBuy)
+         c.buy.phase = PHASE_WAIT_CROSS;
+      else
+         c.sell.phase = PHASE_WAIT_CROSS;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| PHASE 2: RBR/DBD with leg2 at series index i                     |
 //|   isBuy = true : Rally-Base-Rally -> buy limit                   |
 //|   isBuy = false: Drop-Base-Drop   -> sell limit                  |
+//|   origin = true: the pattern that caused the BOS (formed before  |
+//|                  the trigger candle, so no "after trigger" rule) |
 //+------------------------------------------------------------------+
-void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
+void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy, int i, bool origin)
   {
-   MqlRates leg1      = rates[3];
-   MqlRates base      = rates[2];
-   MqlRates leg2      = rates[1];
+   MqlRates leg1      = rates[i + 2];
+   MqlRates base      = rates[i + 1];
+   MqlRates leg2      = rates[i];
    string   side      = isBuy ? "BUY" : "SELL";
    string   pattern   = isBuy ? "RBR" : "DBD";
    datetime crossTime = isBuy ? c.buy.crossTime : c.sell.crossTime;
    int      setupNo   = (isBuy ? c.buy.orders : c.sell.orders) + 1;
 
-   //--- pattern must form after the cross
-   if(InpAllowCrossAsLeg ? (leg1.time < crossTime) : (leg1.time <= crossTime))
+   //--- a new pattern must form after the trigger candle
+   if(!origin && (InpAllowCrossAsLeg ? (leg1.time < crossTime) : (leg1.time <= crossTime)))
       return;
 
-   //--- RBR: bullish, bearish, bullish   DBD: bearish, bullish, bearish
-   if(isBuy)
-     {
-      if(!IsBullish(leg1) || !IsBearish(base) || !IsBullish(leg2))
-         return;
-     }
-   else
-     {
-      if(!IsBearish(leg1) || !IsBullish(base) || !IsBearish(leg2))
-         return;
-     }
+   if(!IsPatternAt(rates, i, isBuy))
+      return;
 
    double leg1Size = CandleSize(leg1);
    double baseSize = CandleSize(base);
    double leg2Size = CandleSize(leg2);
-   bool   l1Longer = leg1Size > baseSize;
-   bool   l2Longer = leg2Size > baseSize;
-   bool   sizeOk   = InpBothLegsLonger ? (l1Longer && l2Longer) : (l1Longer || l2Longer);
-   if(!sizeOk)
-      return;
 
-   double avgSize = AverageCandleSize(rates, 4, InpAvgSizePeriod);
+   double avgSize = AverageCandleSize(rates, i + 3, InpAvgSizePeriod);
    double minLeg  = avgSize * InpAvgSizeMultiplier;
 
    //--- zone = base candle body. Near edge (base open) is the edge closest to price:
@@ -608,17 +670,19 @@ void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
 
    AddEvent(c, side + " " + pattern + " zone " + DoubleToString(zoneBottom, _Digits) + "-" +
             DoubleToString(zoneTop, _Digits) + " entry " + DoubleToString(entry, _Digits) +
-            " (setup #" + (string)setupNo + " after cross): " + result);
+            (origin ? " (BOS origin, setup #" : " (setup #") + (string)setupNo + "): " + result);
 
    if(InpLogSetups)
       LogSetup(c, isBuy, base.time, leg1Size, baseSize, leg2Size, avgSize,
-               zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, result);
+               zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, origin, result);
 
    if(ticket > 0)
      {
-      AddTradeRec(c, isBuy, ticket, base.time, zoneTop, zoneBottom, entry, sl, tp, lots, setupNo);
-      //--- setup consumed: wait for the next cross, unless more setups per cross are allowed
-      bool keepLooking = InpMultipleSetups && (InpMaxSetupsPerCross == 0 || setupNo < InpMaxSetupsPerCross);
+      AddTradeRec(c, isBuy, ticket, base.time, zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, origin);
+      //--- setup consumed: wait for the next trigger, unless more setups per trigger are allowed.
+      //--- BOS "both" mode: after the origin pattern, keep looking for a new one after the BOS
+      bool keepLooking = (origin && InpBOSSetup == BOS_SETUP_BOTH) ||
+                         (InpMultipleSetups && (InpMaxSetupsPerCross == 0 || setupNo < InpMaxSetupsPerCross));
       if(isBuy)
         {
          c.buy.orders = setupNo;
@@ -638,7 +702,8 @@ void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
 //| Trade tracking                                                   |
 //+------------------------------------------------------------------+
 void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime,
-                 double zoneTop, double zoneBottom, double entry, double sl, double tp, double lots, int setupNo)
+                 double zoneTop, double zoneBottom, double entry, double sl, double tp, double lots, int setupNo,
+                 bool origin)
   {
    double loss = 0.0;
    if(!OrderCalcProfit(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, entry, sl, loss))
@@ -664,6 +729,7 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime
    g_recs[n].mfe          = 0.0;
    g_recs[n].mae          = 0.0;
    g_recs[n].setupNo      = setupNo;
+   g_recs[n].origin       = origin;
    g_recs[n].cancelReason = "";
   }
 
@@ -1014,7 +1080,7 @@ bool BreaksLevel(const MqlRates &bar, double level, bool up)
 
 //--- bullish BOS: the last closed candle [1] is the FIRST to break the most recent
 //--- confirmed swing high (confirmed by N candles before [1]). Bearish is the mirror.
-bool FindBOS(const MqlRates &r[], int count, bool bullish, double &level, datetime &swingTime)
+bool FindBOS(const MqlRates &r[], int count, bool bullish, double &level, datetime &swingTime, int &swingIdx)
   {
    int n    = InpSwingStrength;
    int maxJ = MathMin(InpBOSLookback, count - n - 1);
@@ -1024,6 +1090,7 @@ bool FindBOS(const MqlRates &r[], int count, bool bullish, double &level, dateti
          continue;
       level     = bullish ? r[j].high : r[j].low;
       swingTime = r[j].time;
+      swingIdx  = j;
       if(!BreaksLevel(r[1], level, bullish))
          return false;
       for(int k = 2; k < j; k++)
@@ -1290,6 +1357,7 @@ void WriteSettingsFile()
    WriteLine(h, "swing_strength," + (string)InpSwingStrength);
    WriteLine(h, "bos_lookback," + (string)InpBOSLookback);
    WriteLine(h, "bos_break_by_close," + (string)InpBOSBreakByClose);
+   WriteLine(h, "bos_setup," + EnumToString(InpBOSSetup));
    WriteLine(h, "size_mode," + EnumToString(InpSizeMode));
    WriteLine(h, "both_legs_longer," + (string)InpBothLegsLonger);
    WriteLine(h, "allow_cross_as_leg," + (string)InpAllowCrossAsLeg);
@@ -1360,7 +1428,8 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
                 (filled && riskDist > 0.0 ? Rn(r.mae / riskDist) : "") + "," +
                 Mn(AccountInfoDouble(ACCOUNT_BALANCE)) + "," +
                 Mn(AccountInfoDouble(ACCOUNT_EQUITY)) + "," +
-                (string)r.setupNo;
+                (string)r.setupNo + "," +
+                (r.origin ? "BOS_ORIGIN" : "AFTER_TRIGGER");
    WriteLine(g_fhTrades, row);
    if(!g_isTester)
       FileFlush(g_fhTrades);
@@ -1368,7 +1437,7 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
 
 void LogSetup(const TFContext &c, bool isBuy, datetime baseTime, double leg1Size, double baseSize,
               double leg2Size, double avgSize, double zoneTop, double zoneBottom,
-              double entry, double sl, double tp, double lots, int setupNo, const string result)
+              double entry, double sl, double tp, double lots, int setupNo, bool origin, const string result)
   {
    if(g_fhSetups == INVALID_HANDLE)
       return;
@@ -1389,7 +1458,8 @@ void LogSetup(const TFContext &c, bool isBuy, datetime baseTime, double leg1Size
                 DoubleToString(InpRewardRisk, 2) + "," +
                 (lots > 0.0 ? DoubleToString(lots, LotDigits()) : "") + "," +
                 result + "," +
-                (string)setupNo;
+                (string)setupNo + "," +
+                (origin ? "BOS_ORIGIN" : "AFTER_TRIGGER");
    WriteLine(g_fhSetups, row);
   }
 
