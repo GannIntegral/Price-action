@@ -18,7 +18,7 @@ Log analysis: [`tools/analyze_logs.py`](tools/analyze_logs.py)
 | Stop loss | Below the base candle's low | Above the base candle's high |
 | Take profit | 1:5 risk:reward | 1:5 risk:reward |
 
-Every enabled timeframe runs the strategy on its own, and buy and sell setups are tracked separately. After a limit order is placed, that side goes back to waiting for a new PHASE 1 cross. If a candle closes back across the MA before PHASE 2, that side's PHASE 1 is reset. Both behaviours can be changed in the inputs.
+Every enabled timeframe runs the strategy on its own, and buy and sell setups are tracked separately. After a limit order is placed, that side goes back to waiting for a new PHASE 1 cross (or, with *Keep looking for more setups* on, keeps looking for the next setup). If a candle closes back across the MA before PHASE 2, that side's PHASE 1 is reset. Both behaviours can be changed in the inputs.
 
 ## Install
 
@@ -43,6 +43,8 @@ Every enabled timeframe runs the strategy on its own, and buy and sell setups ar
 | Average period | 20 | Number of candles before the pattern used for the average |
 | Average multiplier | 1.0 | Rally/drop must be bigger than average × this (e.g. 1.5 = 50% bigger) |
 | Reset PHASE 1 on close across MA | true | Start over if price closes back across the MA (below for buys, above for sells) |
+| Keep looking for more setups after an order | false | `false` = one order per MA cross. `true` = after an order is placed, keep looking for the next RBR/DBD until PHASE 1 resets (close back across the MA) or a new cross |
+| Max orders per MA cross | 0 | Limit for the option above (0 = no limit). E.g. 2 = first and second setup only |
 | Limit order price | Near edge | Near edge (base open), middle, or far edge (base close) |
 | Reward:Risk | 5.0 | TP = entry ± 5 × distance from entry to SL |
 | SL buffer (points) | 0 | Extra distance below the base low (buys) / above the base high (sells) |
@@ -69,7 +71,7 @@ Each run writes a new set of files named `RBR_<symbol>_[TEST_]<date>_<time>_<id>
 | File | One row per | Columns |
 |---|---|---|
 | `_settings.csv` | input | All inputs of the run, so runs with different settings can be compared |
-| `_trades.csv` | limit order | Timeframe, direction, zone, entry, SL, TP, target RR, lots, money at risk, status (CLOSED / CANCELLED / OPEN_AT_END / PENDING_AT_END), reason (TP, SL, CLOSE_BELOW_MA, EXPIRED…), fill and close time/price, bars to fill, bars held, profit, commission, swap, net, **R multiple**, **MFE R** (best move in its favour, in R), **MAE R** (worst move against it), balance, equity |
+| `_trades.csv` | limit order | Setup number after the MA cross (1st, 2nd…), timeframe, direction, zone, entry, SL, TP, target RR, lots, money at risk, status (CLOSED / CANCELLED / OPEN_AT_END / PENDING_AT_END), reason (TP, SL, CLOSE_BELOW_MA, EXPIRED…), fill and close time/price, bars to fill, bars held, profit, commission, swap, net, **R multiple**, **MFE R** (best move in its favour, in R), **MAE R** (worst move against it), balance, equity |
 | `_setups.csv` | detected RBR/DBD | Leg and base sizes, average size, zone, entry/SL/TP, and what happened: PLACED, or why it was skipped (SKIP_AVG_SIZE, SKIP_TRADE_OPEN, SKIP_PRICE_IN_ZONE…) |
 | `_candles.csv` | closed candle per timeframe | OHLC, MA, above/below MA, buy and sell phase, balance, equity, open/pending trades on that timeframe, floating P/L, open trade's entry, SL, TP, current R, MFE/MAE, and the events of that candle |
 
@@ -81,7 +83,7 @@ python3 tools/analyze_logs.py path/to/folder   # newest run in a folder
 python3 tools/analyze_logs.py path/to/RBR_..._trades.csv
 ```
 
-It prints results per timeframe, per direction and per timeframe + direction (trades, win %, net, average R,
+It prints results per timeframe, per direction, per timeframe + direction and (when more setups per cross are on) per setup number after the cross (trades, win %, net, average R,
 profit factor, longest losing streak), the limit order fill rate, the reasons setups were skipped, the max
 equity drawdown, and a **Reward:Risk table**: the expected R per trade if TP had been 1:1, 1:1.5, 1:2 … using
 each trade's MFE. A trade counts as a win at 1:X if price moved X × risk in its favour before the stop was hit.

@@ -24,7 +24,7 @@
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "2.00"
+#property version   "2.10"
 #property description "MA200 trend filter + Rally-Base-Rally / Drop-Base-Drop limit orders on any set of timeframes, with CSV logging"
 
 #include <Trade/Trade.mqh>
@@ -77,6 +77,7 @@ struct SetupState
   {
    ENUM_PHASE phase;
    datetime   crossTime;
+   int        orders;       // orders placed since the cross
   };
 
 //--- one enabled timeframe
@@ -115,6 +116,7 @@ struct TradeRec
    double   fillPrice;
    double   mfe;          // max favourable excursion (price distance from fill)
    double   mae;          // max adverse excursion (price distance from fill)
+   int      setupNo;      // 1 = first order after the MA cross, 2 = second, ...
    string   cancelReason;
   };
 
@@ -154,6 +156,8 @@ input ENUM_CANDLE_SIZE   InpSizeMode             = SIZE_BODY; // Candle length m
 input bool               InpBothLegsLonger       = true;      // Both rallies/drops longer than base (false = either one)
 input bool               InpAllowCrossAsLeg      = true;      // Cross candle may be the first rally/drop
 input bool               InpResetOnCloseAcrossMA = true;      // Reset PHASE 1 if a candle closes back across the MA
+input bool               InpMultipleSetups       = false;     // Keep looking for more setups after an order (until PHASE 1 resets)
+input int                InpMaxSetupsPerCross    = 0;         // Max orders per MA cross when the above is on (0 = no limit)
 
 input group "Average candle size filter (avoid sideways markets)"
 input bool               InpUseAvgSizeFilter    = true;      // Rallies/drops must be above average candle size
@@ -212,16 +216,18 @@ bool            g_showComment = true;
 const string OBJ_PREFIX = "RBR_MA200_";
 const string LOG_FOLDER = "RBR_MA200_logs\\";
 
-const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity";
-const string SETUPS_HEADER = "detected_time,timeframe,direction,pattern,base_time,leg1_points,base_points,leg2_points,avg_points,zone_top,zone_bottom,entry,sl,tp,rr_target,lots,result";
+const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,setup_no";
+const string SETUPS_HEADER = "detected_time,timeframe,direction,pattern,base_time,leg1_points,base_points,leg2_points,avg_points,zone_top,zone_bottom,entry,sl,tp,rr_target,lots,result,setup_no";
 const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,buy_phase,sell_phase,balance,equity,tf_open_trades,tf_pending,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0)
+   if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0 ||
+      InpMaxSetupsPerCross < 0)
      {
-      Print("Invalid inputs: MA period and average period must be >= 1, Reward:Risk and average multiplier > 0");
+      Print("Invalid inputs: MA period and average period must be >= 1, Reward:Risk and average multiplier > 0, " +
+            "max setups per cross >= 0");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -252,8 +258,10 @@ int OnInit()
       g_ctx[n].lastBarTime    = 0;
       g_ctx[n].buy.phase      = PHASE_WAIT_CROSS;
       g_ctx[n].buy.crossTime  = 0;
+      g_ctx[n].buy.orders     = 0;
       g_ctx[n].sell.phase     = PHASE_WAIT_CROSS;
       g_ctx[n].sell.crossTime = 0;
+      g_ctx[n].sell.orders    = 0;
       g_ctx[n].barEvents      = "";
       g_ctx[n].status         = "";
      }
@@ -395,6 +403,7 @@ bool ProcessTimeframe(TFContext &c)
      {
       c.buy.phase     = PHASE_WAIT_PATTERN;
       c.buy.crossTime = rates[1].time;
+      c.buy.orders    = 0;
       AddEvent(c, "BUY PHASE 1 passed - waiting for Rally-Base-Rally");
      }
 
@@ -403,6 +412,7 @@ bool ProcessTimeframe(TFContext &c)
      {
       c.sell.phase     = PHASE_WAIT_PATTERN;
       c.sell.crossTime = rates[1].time;
+      c.sell.orders    = 0;
       AddEvent(c, "SELL PHASE 1 passed - waiting for Drop-Base-Drop");
      }
 
@@ -431,6 +441,7 @@ void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
    string   side      = isBuy ? "BUY" : "SELL";
    string   pattern   = isBuy ? "RBR" : "DBD";
    datetime crossTime = isBuy ? c.buy.crossTime : c.sell.crossTime;
+   int      setupNo   = (isBuy ? c.buy.orders : c.sell.orders) + 1;
 
    //--- pattern must form after the cross
    if(InpAllowCrossAsLeg ? (leg1.time < crossTime) : (leg1.time <= crossTime))
@@ -528,20 +539,30 @@ void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
       DrawZone(c, isBuy, base.time, zoneTop, zoneBottom, sl, tp);
 
    AddEvent(c, side + " " + pattern + " zone " + DoubleToString(zoneBottom, _Digits) + "-" +
-            DoubleToString(zoneTop, _Digits) + " entry " + DoubleToString(entry, _Digits) + ": " + result);
+            DoubleToString(zoneTop, _Digits) + " entry " + DoubleToString(entry, _Digits) +
+            " (setup #" + (string)setupNo + " after cross): " + result);
 
    if(InpLogSetups)
       LogSetup(c, isBuy, base.time, leg1Size, baseSize, leg2Size, avgSize,
-               zoneTop, zoneBottom, entry, sl, tp, lots, result);
+               zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, result);
 
    if(ticket > 0)
      {
-      AddTradeRec(c, isBuy, ticket, base.time, zoneTop, zoneBottom, entry, sl, tp, lots);
-      //--- setup consumed: wait for the next cross
+      AddTradeRec(c, isBuy, ticket, base.time, zoneTop, zoneBottom, entry, sl, tp, lots, setupNo);
+      //--- setup consumed: wait for the next cross, unless more setups per cross are allowed
+      bool keepLooking = InpMultipleSetups && (InpMaxSetupsPerCross == 0 || setupNo < InpMaxSetupsPerCross);
       if(isBuy)
-         c.buy.phase = PHASE_WAIT_CROSS;
+        {
+         c.buy.orders = setupNo;
+         if(!keepLooking)
+            c.buy.phase = PHASE_WAIT_CROSS;
+        }
       else
-         c.sell.phase = PHASE_WAIT_CROSS;
+        {
+         c.sell.orders = setupNo;
+         if(!keepLooking)
+            c.sell.phase = PHASE_WAIT_CROSS;
+        }
      }
   }
 
@@ -549,7 +570,7 @@ void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy)
 //| Trade tracking                                                   |
 //+------------------------------------------------------------------+
 void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime,
-                 double zoneTop, double zoneBottom, double entry, double sl, double tp, double lots)
+                 double zoneTop, double zoneBottom, double entry, double sl, double tp, double lots, int setupNo)
   {
    double loss = 0.0;
    if(!OrderCalcProfit(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, entry, sl, loss))
@@ -574,6 +595,7 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime
    g_recs[n].fillPrice    = 0.0;
    g_recs[n].mfe          = 0.0;
    g_recs[n].mae          = 0.0;
+   g_recs[n].setupNo      = setupNo;
    g_recs[n].cancelReason = "";
   }
 
@@ -1000,7 +1022,9 @@ string PhaseText(bool isBuy, const TFContext &c)
    datetime   cross = isBuy ? c.buy.crossTime : c.sell.crossTime;
    if(phase == PHASE_WAIT_CROSS)
       return "wait cross";
-   return "wait " + (isBuy ? "RBR" : "DBD") + " (cross " + TimeToString(cross, TIME_DATE | TIME_MINUTES) + ")";
+   int orders = isBuy ? c.buy.orders : c.sell.orders;
+   return "wait " + (isBuy ? "RBR" : "DBD") + " (cross " + TimeToString(cross, TIME_DATE | TIME_MINUTES) +
+          (orders > 0 ? ", " + (string)orders + " placed" : "") + ")";
   }
 
 string PhaseCode(bool isBuy, const TFContext &c)
@@ -1133,6 +1157,8 @@ void WriteSettingsFile()
    WriteLine(h, "both_legs_longer," + (string)InpBothLegsLonger);
    WriteLine(h, "allow_cross_as_leg," + (string)InpAllowCrossAsLeg);
    WriteLine(h, "reset_on_close_across_ma," + (string)InpResetOnCloseAcrossMA);
+   WriteLine(h, "multiple_setups," + (string)InpMultipleSetups);
+   WriteLine(h, "max_setups_per_cross," + (string)InpMaxSetupsPerCross);
    WriteLine(h, "avg_size_filter," + (string)InpUseAvgSizeFilter);
    WriteLine(h, "avg_size_period," + (string)InpAvgSizePeriod);
    WriteLine(h, "avg_size_multiplier," + DoubleToString(InpAvgSizeMultiplier, 2));
@@ -1196,7 +1222,8 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
                 (filled && riskDist > 0.0 ? Rn(r.mfe / riskDist) : "") + "," +
                 (filled && riskDist > 0.0 ? Rn(r.mae / riskDist) : "") + "," +
                 Mn(AccountInfoDouble(ACCOUNT_BALANCE)) + "," +
-                Mn(AccountInfoDouble(ACCOUNT_EQUITY));
+                Mn(AccountInfoDouble(ACCOUNT_EQUITY)) + "," +
+                (string)r.setupNo;
    WriteLine(g_fhTrades, row);
    if(!g_isTester)
       FileFlush(g_fhTrades);
@@ -1204,7 +1231,7 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
 
 void LogSetup(const TFContext &c, bool isBuy, datetime baseTime, double leg1Size, double baseSize,
               double leg2Size, double avgSize, double zoneTop, double zoneBottom,
-              double entry, double sl, double tp, double lots, const string result)
+              double entry, double sl, double tp, double lots, int setupNo, const string result)
   {
    if(g_fhSetups == INVALID_HANDLE)
       return;
@@ -1224,7 +1251,8 @@ void LogSetup(const TFContext &c, bool isBuy, datetime baseTime, double leg1Size
                 Px(tp) + "," +
                 DoubleToString(InpRewardRisk, 2) + "," +
                 (lots > 0.0 ? DoubleToString(lots, LotDigits()) : "") + "," +
-                result;
+                result + "," +
+                (string)setupNo;
    WriteLine(g_fhSetups, row);
   }
 

@@ -141,6 +141,14 @@ def main():
         print_table("== Results by direction ==", head, stats_rows(by_dir))
         print_table("== Results by timeframe and direction ==", head, stats_rows(by_tf_dir))
 
+        #--- 1st order after the MA cross vs later ones (EA option "Keep looking for more setups")
+        if any(r.get("setup_no") not in (None, "", "1") for r in closed):
+            by_no = defaultdict(list)
+            for r in closed:
+                n = int(num(r.get("setup_no"), 1))
+                by_no["#%d" % n if n < 4 else "#4+"].append(r)
+            print_table("== Results by setup number after the MA cross ==", head, stats_rows(dict(sorted(by_no.items()))))
+
     #--- fill rate: how many limit orders were never reached
     fills = defaultdict(Counter)
     for r in trades:
