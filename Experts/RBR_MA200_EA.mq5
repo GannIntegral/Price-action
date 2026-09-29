@@ -1,31 +1,31 @@
 //+------------------------------------------------------------------+
 //|                                                RBR_MA200_EA.mq5  |
-//|  MA200 trend-following + Rally-Base-Rally / Drop-Base-Drop       |
-//|  supply & demand zone limit orders, on any set of timeframes,    |
-//|  with CSV logging of setups, trades and every closed candle.     |
+//|  MA200 rejection + RBR/DBD base break, market entry.             |
 //|                                                                  |
-//|  BUY  (Rally-Base-Rally)                                         |
-//|  PHASE 1: a candle closes above the MA after the previous candle |
-//|           closed below it (first close above, coming from below) |
-//|  PHASE 2: bullish -> bearish -> bullish, rallies longer than the |
-//|           base. Base open..close is the demand zone.             |
-//|  ENTRY  : buy limit at the zone (if price has not reached it),   |
-//|           SL below the base low, TP = 1:5 risk/reward.           |
+//|  SELL (MA200 heading down)                                       |
+//|  PHASE 1: a Rally-Base-Rally approaches the falling MA from      |
+//|           below and crosses it (last rally closes above the MA). |
+//|  PHASE 2: a candle closes below the RBR base.                    |
+//|  ENTRY  : sell at market on the open of the next candle,         |
+//|           SL above the RBR high, TP = Reward:Risk (5 default).   |
 //|                                                                  |
-//|  SELL (Drop-Base-Drop) - the mirror image                        |
-//|  PHASE 1: a candle closes below the MA after the previous candle |
-//|           closed above it (first close below, coming from above) |
-//|  PHASE 2: bearish -> bullish -> bearish, drops longer than the   |
-//|           base. Base open..close is the supply zone.             |
-//|  ENTRY  : sell limit at the zone (if price has not reached it),  |
-//|           SL above the base high, TP = 1:5 risk/reward.          |
+//|  BUY (MA200 heading up) - the mirror image                       |
+//|  PHASE 1: a Drop-Base-Drop approaches the rising MA from above   |
+//|           and crosses it (last drop closes below the MA).        |
+//|  PHASE 2: a candle closes above the DBD base.                    |
+//|  ENTRY  : buy at market on the open of the next candle,          |
+//|           SL below the DBD low, TP = Reward:Risk.                |
+//|                                                                  |
+//|  MA angle: atan( MA move over N candles / ATR ) in degrees.      |
+//|  45 deg = the MA moved one ATR in N candles, on any symbol and   |
+//|  timeframe (chart degrees depend on zoom, this does not).        |
 //|                                                                  |
 //|  Every enabled timeframe runs its own copy of the strategy with  |
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "2.30"
-#property description "MA200 trend filter + Rally-Base-Rally / Drop-Base-Drop limit orders on any set of timeframes, with CSV logging"
+#property version   "3.00"
+#property description "MA200 rejection: RBR/DBD crossing the MA against its slope, market entry on the close beyond the base"
 
 #include <Trade/Trade.mqh>
 
@@ -40,11 +40,22 @@ enum ENUM_CANDLE_SIZE
    SIZE_RANGE = 1  // Full range (high to low)
   };
 
-enum ENUM_ENTRY_LEVEL
+enum ENUM_CROSS_MODE
   {
-   ENTRY_ZONE_NEAR = 0, // Near edge (base open)
-   ENTRY_ZONE_MID  = 1, // Zone middle
-   ENTRY_ZONE_FAR  = 2  // Far edge (base close)
+   CROSS_BY_CLOSE = 0, // Last rally/drop closes beyond the MA
+   CROSS_BY_WICK  = 1  // Any wick of the pattern crosses the MA
+  };
+
+enum ENUM_BREAK_LEVEL
+  {
+   BREAK_BASE_EXTREME = 0, // Base low (sell) / base high (buy)
+   BREAK_BASE_BODY    = 1  // Base body bottom (sell) / body top (buy)
+  };
+
+enum ENUM_SL_MODE
+  {
+   SL_PATTERN_EXTREME = 0, // RBR high (sell) / DBD low (buy)
+   SL_EXTREME_SINCE   = 1  // Highest high (sell) / lowest low (buy) since the pattern
   };
 
 enum ENUM_LOT_MODE
@@ -55,9 +66,9 @@ enum ENUM_LOT_MODE
 
 enum ENUM_TRADE_DIRECTION
   {
-   DIR_BOTH      = 0, // Buy (RBR) and sell (DBD)
-   DIR_BUY_ONLY  = 1, // Buy only (RBR)
-   DIR_SELL_ONLY = 2  // Sell only (DBD)
+   DIR_BOTH      = 0, // Sell (RBR) and buy (DBD)
+   DIR_BUY_ONLY  = 1, // Buy only (DBD under a rising MA)
+   DIR_SELL_ONLY = 2  // Sell only (RBR under a falling MA)
   };
 
 enum ENUM_TRADE_SCOPE
@@ -66,32 +77,25 @@ enum ENUM_TRADE_SCOPE
    SCOPE_GLOBAL = 1  // Across all timeframes
   };
 
-enum ENUM_SETUP_TRIGGER
+//--- a pattern that passed PHASE 1 and waits for the close beyond its base (PHASE 2)
+struct Watch
   {
-   TRIGGER_MA_CROSS = 0, // MA cross
-   TRIGGER_BOS      = 1, // Break of structure (BOS)
-   TRIGGER_BOS_MA   = 2  // BOS on the right side of the MA
-  };
-
-enum ENUM_BOS_SETUP
-  {
-   BOS_SETUP_BOTH   = 0, // The RBR/DBD that caused the BOS + new ones after it
-   BOS_SETUP_ORIGIN = 1, // Only the RBR/DBD that caused the BOS
-   BOS_SETUP_NEW    = 2  // Only new RBR/DBD that form after the BOS
-  };
-
-enum ENUM_PHASE
-  {
-   PHASE_WAIT_CROSS   = 0, // waiting for PHASE 1 (MA cross or BOS)
-   PHASE_WAIT_PATTERN = 1  // PHASE 1 passed, waiting for PHASE 2 (RBR / DBD)
-  };
-
-//--- per-direction setup state
-struct SetupState
-  {
-   ENUM_PHASE phase;
-   datetime   crossTime;    // time of the PHASE 1 candle (MA cross or BOS)
-   int        orders;       // orders placed since the cross
+   bool     active;
+   datetime baseTime;
+   datetime crossTime;    // candle that crossed the MA (last rally/drop)
+   double   baseHigh;
+   double   baseLow;
+   double   patHigh;      // highest high of the 3 pattern candles
+   double   patLow;       // lowest low of the 3 pattern candles
+   double   breakLevel;   // PHASE 2 level: close beyond it triggers the trade
+   double   slRef;        // SL reference (pattern extreme, or extreme since the pattern)
+   double   ma;           // MA at the cross candle
+   double   angle;        // MA angle at PHASE 1 (degrees)
+   int      bars;         // candles waited since PHASE 1
+   double   leg1Size;
+   double   baseSize;
+   double   leg2Size;
+   double   avgSize;
   };
 
 //--- one enabled timeframe
@@ -103,26 +107,28 @@ struct TFContext
    string          name;        // "M20"
    ulong           magic;
    int             maHandle;
+   int             atrHandle;
    datetime        lastBarTime;
-   SetupState      buy;
-   SetupState      sell;
+   double          angle;       // MA angle on the last closed candle
+   Watch           sell;        // RBR under a falling MA
+   Watch           buy;         // DBD above a rising MA
    string          barEvents;   // events since the last candle log row
    string          status;
   };
 
-//--- one order placed by the EA, followed until it is cancelled or closed
+//--- one order placed by the EA, followed until it is closed
 struct TradeRec
   {
-   ulong    ticket;       // pending order ticket = position identifier once filled
+   ulong    ticket;       // order ticket = position identifier
    int      slot;         // g_ctx index of the timeframe that placed it
    bool     isBuy;
-   int      state;        // REC_PENDING / REC_OPEN
+   int      state;        // REC_PENDING (sent) / REC_OPEN
    datetime baseTime;
    datetime placedTime;
    datetime fillTime;
-   double   zoneTop;
-   double   zoneBottom;
-   double   entry;
+   double   zoneTop;      // pattern base high
+   double   zoneBottom;   // pattern base low
+   double   entry;        // price when the order was sent
    double   sl;
    double   tp;
    double   lots;
@@ -130,8 +136,9 @@ struct TradeRec
    double   fillPrice;
    double   mfe;          // max favourable excursion (price distance from fill)
    double   mae;          // max adverse excursion (price distance from fill)
-   int      setupNo;      // 1 = first order after the MA cross / BOS, 2 = second, ...
-   bool     origin;       // true = the RBR/DBD that caused the BOS
+   double   angle1;       // MA angle at PHASE 1
+   double   angle2;       // MA angle at entry
+   int      waitBars;     // candles between PHASE 1 and PHASE 2
    string   cancelReason;
   };
 
@@ -166,33 +173,29 @@ input ENUM_MA_METHOD       InpMAMethod   = MODE_SMA;     // MA method
 input ENUM_APPLIED_PRICE   InpMAPrice    = PRICE_CLOSE;  // MA applied price
 input ENUM_TRADE_DIRECTION InpDirection  = DIR_BOTH;     // Trade direction
 
-input group "PHASE 1 trigger"
-input ENUM_SETUP_TRIGGER InpTrigger          = TRIGGER_MA_CROSS; // Look for setups after
-input int                InpSwingStrength    = 3;                // BOS: swing = highest high / lowest low of N candles each side
-input int                InpBOSLookback      = 100;              // BOS: candles searched for the last swing high/low
-input bool               InpBOSBreakByClose  = true;             // BOS: candle must CLOSE beyond the swing (false = wick is enough)
-input bool               InpDrawBOS          = true;             // BOS: draw the broken swing level on the chart
-input ENUM_BOS_SETUP     InpBOSSetup         = BOS_SETUP_BOTH;   // BOS: which RBR/DBD to trade
+input group "MA angle (trend strength)"
+input int                InpAngleBars         = 10;    // Angle measured over N candles
+input int                InpAngleATRPeriod    = 14;    // ATR period used to scale the angle
+input double             InpMinAngle          = 0.0;   // Min MA angle in degrees (0 = any slope; 45 = MA moved 1 ATR in N candles)
+input bool               InpCheckAngleAtEntry = false; // Also require the min angle at PHASE 2 (entry)
 
-input group "Rally-Base-Rally / Drop-Base-Drop"
-input ENUM_CANDLE_SIZE   InpSizeMode             = SIZE_BODY; // Candle length measured by
-input bool               InpBothLegsLonger       = true;      // Both rallies/drops longer than base (false = either one)
-input bool               InpAllowCrossAsLeg      = true;      // Cross candle may be the first rally/drop
-input bool               InpResetOnCloseAcrossMA = true;      // Reset PHASE 1 when the trigger breaks (MA: close back across, BOS: opposite BOS)
-input bool               InpMultipleSetups       = false;     // Keep looking for more setups after an order (until PHASE 1 resets)
-input int                InpMaxSetupsPerCross    = 0;         // Max orders per MA cross when the above is on (0 = no limit)
+input group "PHASE 1: RBR (sell) / DBD (buy) crossing the MA against its slope"
+input ENUM_CANDLE_SIZE   InpSizeMode          = SIZE_BODY;      // Candle length measured by
+input bool               InpBothLegsLonger    = true;           // Both rallies/drops longer than base (false = either one)
+input ENUM_CROSS_MODE    InpCrossMode         = CROSS_BY_CLOSE; // Pattern crosses the MA when
+input bool               InpUseAvgSizeFilter  = true;           // Rallies/drops must be above average candle size
+input int                InpAvgSizePeriod     = 20;             // Candles used for the average (before the pattern)
+input double             InpAvgSizeMultiplier = 1.0;            // Rally/drop size must exceed average x this
 
-input group "Average candle size filter (avoid sideways markets)"
-input bool               InpUseAvgSizeFilter    = true;      // Rallies/drops must be above average candle size
-input int                InpAvgSizePeriod       = 20;        // Candles used for the average (before the pattern)
-input double             InpAvgSizeMultiplier   = 1.0;       // Rally/drop size must exceed average x this
+input group "PHASE 2: close beyond the base"
+input ENUM_BREAK_LEVEL   InpBreakLevel          = BREAK_BASE_EXTREME; // Candle must close beyond
+input int                InpMaxWaitBars         = 30;                 // Give up after N candles without PHASE 2 (0 = never)
+input bool               InpCancelBeyondPattern = true;               // Give up if a candle closes beyond the RBR high / DBD low
 
-input group "Order"
-input ENUM_ENTRY_LEVEL   InpEntryLevel            = ENTRY_ZONE_NEAR; // Limit order price
-input double             InpRewardRisk            = 5.0;             // Reward:Risk (TP = RR x risk)
-input int                InpSLBufferPoints        = 0;               // Extra SL buffer beyond the base low/high (points)
-input int                InpExpiryBars            = 0;               // Cancel pending after N bars of its timeframe (0 = never)
-input bool               InpCancelOnCloseAcrossMA = true;            // Cancel pending when the trigger breaks (MA: close across, BOS: opposite BOS)
+input group "Order (market order on the open of the candle after PHASE 2)"
+input double             InpRewardRisk     = 5.0;                // Reward:Risk (TP = RR x risk)
+input ENUM_SL_MODE       InpSLMode         = SL_PATTERN_EXTREME; // Stop loss behind
+input int                InpSLBufferPoints = 0;                  // Extra SL buffer (points)
 
 input group "Money management"
 input ENUM_LOT_MODE      InpLotMode     = LOT_FIXED; // Lot mode
@@ -202,16 +205,16 @@ input double             InpRiskPercent = 1.0;       // Risk % of balance per tr
 input group "General"
 input ulong              InpMagic           = 20020;         // Base magic number (+0 for M1 ... +20 for MN1)
 input int                InpSlippagePoints  = 10;            // Slippage (points)
-input bool               InpOneTradeAtATime = true;          // Skip new setups while a position/order exists
+input bool               InpOneTradeAtATime = true;          // Skip new trades while a position exists
 input ENUM_TRADE_SCOPE   InpTradeScope      = SCOPE_PER_TF;  // One trade at a time applies
-input bool               InpDrawZones       = true;          // Draw zones on chart
-input bool               InpDrawAllTFZones  = false;         // Draw zones of all timeframes (false = chart timeframe only)
+input bool               InpDrawZones       = true;          // Draw pattern bases on chart
+input bool               InpDrawAllTFZones  = false;         // Draw bases of all timeframes (false = chart timeframe only)
 input string             InpComment         = "RBR_MA200";   // Order comment (timeframe is appended)
 
 input group "CSV logging (for analysis)"
-input bool               InpLogTrades   = true;   // Log trades: fill, SL/TP, result, R multiple, MFE/MAE
-input bool               InpLogSetups   = true;   // Log every detected RBR/DBD setup and what happened to it
-input bool               InpLogCandles  = true;   // Log every closed candle: MA, phases, open trade, balance, equity
+input bool               InpLogTrades   = true;   // Log trades: entry, SL/TP, result, R multiple, MFE/MAE, MA angle
+input bool               InpLogSetups   = true;   // Log every PHASE 1 / PHASE 2 / give-up event
+input bool               InpLogCandles  = true;   // Log every closed candle: MA, angle, state, open trade, balance, equity
 input bool               InpLogToCommon = true;   // Write to Terminal\Common\Files (also used by the tester)
 input string             InpLogPrefix   = "RBR";  // Log file name prefix
 
@@ -239,18 +242,18 @@ bool            g_showComment = true;
 const string OBJ_PREFIX = "RBR_MA200_";
 const string LOG_FOLDER = "RBR_MA200_logs\\";
 
-const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,setup_no,setup_source";
-const string SETUPS_HEADER = "detected_time,timeframe,direction,pattern,base_time,leg1_points,base_points,leg2_points,avg_points,zone_top,zone_bottom,entry,sl,tp,rr_target,lots,result,setup_no,setup_source";
-const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,buy_phase,sell_phase,balance,equity,tf_open_trades,tf_pending,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
+const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,angle_phase1,angle_entry,bars_waited";
+const string SETUPS_HEADER = "time,timeframe,direction,pattern,result,base_time,base_high,base_low,pattern_high,pattern_low,break_level,sl_ref,ma,angle_phase1,angle_now,bars_waited,leg1_points,base_points,leg2_points,avg_points,entry,sl,tp,lots";
+const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,ma_angle,buy_state,sell_state,balance,equity,tf_open_trades,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0 ||
-      InpMaxSetupsPerCross < 0 || InpSwingStrength < 1 || InpBOSLookback < InpSwingStrength + 3)
+      InpAngleBars < 1 || InpAngleATRPeriod < 1 || InpMinAngle < 0.0 || InpMinAngle >= 90.0 || InpMaxWaitBars < 0)
      {
-      Print("Invalid inputs: MA period and average period must be >= 1, Reward:Risk and average multiplier > 0, " +
-            "max setups per cross >= 0, swing strength >= 1, BOS lookback >= swing strength + 3");
+      Print("Invalid inputs: periods must be >= 1, Reward:Risk and average multiplier > 0, " +
+            "min angle 0..89, max wait bars >= 0");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -263,30 +266,33 @@ int OnInit()
      {
       if(!TFSelected(i))
          continue;
-      int handle = iMA(_Symbol, g_allTF[i], InpMAPeriod, 0, InpMAMethod, InpMAPrice);
-      if(handle == INVALID_HANDLE)
+      int maHandle  = iMA(_Symbol, g_allTF[i], InpMAPeriod, 0, InpMAMethod, InpMAPrice);
+      int atrHandle = iATR(_Symbol, g_allTF[i], InpAngleATRPeriod);
+      if(maHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
         {
-         Print("Failed to create MA handle for ", TFName(g_allTF[i]), ", error ", GetLastError());
+         Print("Failed to create MA/ATR handle for ", TFName(g_allTF[i]), ", error ", GetLastError());
+         if(maHandle != INVALID_HANDLE)
+            IndicatorRelease(maHandle);
+         if(atrHandle != INVALID_HANDLE)
+            IndicatorRelease(atrHandle);
          ReleaseHandles();
          return INIT_FAILED;
         }
       int n = ArraySize(g_ctx);
       ArrayResize(g_ctx, n + 1);
-      g_ctx[n].slot           = n;
-      g_ctx[n].tfIndex        = i;
-      g_ctx[n].tf             = g_allTF[i];
-      g_ctx[n].name           = TFName(g_allTF[i]);
-      g_ctx[n].magic          = InpMagic + (ulong)i;
-      g_ctx[n].maHandle       = handle;
-      g_ctx[n].lastBarTime    = 0;
-      g_ctx[n].buy.phase      = PHASE_WAIT_CROSS;
-      g_ctx[n].buy.crossTime  = 0;
-      g_ctx[n].buy.orders     = 0;
-      g_ctx[n].sell.phase     = PHASE_WAIT_CROSS;
-      g_ctx[n].sell.crossTime = 0;
-      g_ctx[n].sell.orders    = 0;
-      g_ctx[n].barEvents      = "";
-      g_ctx[n].status         = "";
+      g_ctx[n].slot        = n;
+      g_ctx[n].tfIndex     = i;
+      g_ctx[n].tf          = g_allTF[i];
+      g_ctx[n].name        = TFName(g_allTF[i]);
+      g_ctx[n].magic       = InpMagic + (ulong)i;
+      g_ctx[n].maHandle    = maHandle;
+      g_ctx[n].atrHandle   = atrHandle;
+      g_ctx[n].lastBarTime = 0;
+      g_ctx[n].angle       = 0.0;
+      g_ctx[n].sell.active = false;
+      g_ctx[n].buy.active  = false;
+      g_ctx[n].barEvents   = "";
+      g_ctx[n].status      = "";
      }
 
    if(ArraySize(g_ctx) == 0)
@@ -327,8 +333,6 @@ void OnDeinit(const int reason)
          double price = g_recs[i].isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          WriteTradeRow(g_recs[i], "OPEN_AT_END", TimeCurrent(), price, "", FloatingProfit(g_recs[i]), 0.0, 0.0);
         }
-      else
-         WriteTradeRow(g_recs[i], "PENDING_AT_END", 0, 0.0, "", 0.0, 0.0, 0.0);
      }
 
    CloseLogs();
@@ -343,11 +347,8 @@ void OnTick()
 
    bool changed = false;
    for(int i = 0; i < ArraySize(g_ctx); i++)
-     {
-      ManagePendingExpiry(g_ctx[i]);
       if(ProcessTimeframe(g_ctx[i]))
          changed = true;
-     }
 
    if(changed)
      {
@@ -357,8 +358,8 @@ void OnTick()
   }
 
 //+------------------------------------------------------------------+
-//| Runs the strategy for one timeframe on each new candle.          |
-//| Returns true when a new candle was processed.                    |
+//| Runs the strategy for one timeframe on the first tick of each    |
+//| new candle. Returns true when a new candle was processed.        |
 //+------------------------------------------------------------------+
 bool ProcessTimeframe(TFContext &c)
   {
@@ -368,14 +369,11 @@ bool ProcessTimeframe(TFContext &c)
 
    //--- closed candles: [1] = last closed, [2], [3] = before it,
    //--- [4] .. [3 + InpAvgSizePeriod] = candles used for the average size
-   //--- BOS mode also needs enough candles to find the last swing high / low
    int barsNeeded = 4 + InpAvgSizePeriod;
-   if(InpTrigger != TRIGGER_MA_CROSS)
-      barsNeeded = MathMax(barsNeeded, MathMax(InpBOSLookback + InpSwingStrength + 2,
-                                               InpBOSLookback + InpAvgSizePeriod + 2));
+   int maNeeded   = 4 + InpAngleBars;
 
    //--- not enough history for the MA on this timeframe (e.g. MN1 with MA200)
-   if(Bars(_Symbol, c.tf) < InpMAPeriod + barsNeeded)
+   if(Bars(_Symbol, c.tf) < InpMAPeriod + MathMax(barsNeeded, maNeeded))
      {
       c.lastBarTime = barTime;
       c.status      = "  (not enough history)";
@@ -384,126 +382,29 @@ bool ProcessTimeframe(TFContext &c)
 
    MqlRates rates[];
    double   ma[];
+   double   atr[];
    ArraySetAsSeries(rates, true);
    ArraySetAsSeries(ma, true);
+   ArraySetAsSeries(atr, true);
 
    //--- data not ready yet: leave lastBarTime unchanged so the next tick retries this bar
    if(CopyRates(_Symbol, c.tf, 0, barsNeeded, rates) < barsNeeded)
       return false;
-   if(CopyBuffer(c.maHandle, 0, 0, 4, ma) < 4)
+   if(CopyBuffer(c.maHandle, 0, 0, maNeeded, ma) < maNeeded)
       return false;
-   if(rates[0].time != barTime || ma[1] == EMPTY_VALUE || ma[2] == EMPTY_VALUE)
+   if(CopyBuffer(c.atrHandle, 0, 0, 2, atr) < 2)
+      return false;
+   if(rates[0].time != barTime || ma[1] == EMPTY_VALUE || ma[maNeeded - 1] == EMPTY_VALUE || atr[1] == EMPTY_VALUE)
       return false;
 
    c.lastBarTime = barTime;
    c.status      = "";
+   c.angle       = MAAngle(ma, 1, atr[1]);
 
-   bool closedBelowMA = rates[1].close < ma[1];
-   bool closedAboveMA = rates[1].close > ma[1];
-
-   //--- break of structure on the last closed candle
-   bool     useBOS = InpTrigger != TRIGGER_MA_CROSS;
-   bool     useMA  = InpTrigger != TRIGGER_BOS;
-   bool     bullBOS = false, bearBOS = false;
-   double   bullLevel = 0.0, bearLevel = 0.0;
-   datetime bullSwing = 0,   bearSwing = 0;
-   int      bullIdx   = 0,   bearIdx   = 0;
-   if(useBOS)
-     {
-      bullBOS = FindBOS(rates, barsNeeded, true,  bullLevel, bullSwing, bullIdx);
-      bearBOS = FindBOS(rates, barsNeeded, false, bearLevel, bearSwing, bearIdx);
-      if(bullBOS)
-         AddEvent(c, "bullish BOS: closed above swing high " + DoubleToString(bullLevel, _Digits));
-      if(bearBOS)
-         AddEvent(c, "bearish BOS: closed below swing low " + DoubleToString(bearLevel, _Digits));
-      if(InpDrawBOS && (InpDrawAllTFZones || c.tf == Period()))
-        {
-         if(bullBOS)
-            DrawBOS(c, true, bullSwing, rates[1].time, bullLevel);
-         if(bearBOS)
-            DrawBOS(c, false, bearSwing, rates[1].time, bearLevel);
-        }
-     }
-
-   //--- the buy (sell) idea is broken by a close below (above) the MA and/or a bearish (bullish) BOS
-   bool   buyBroken   = (useMA && closedBelowMA) || (useBOS && bearBOS);
-   bool   sellBroken  = (useMA && closedAboveMA) || (useBOS && bullBOS);
-   string buyReason   = (useBOS && bearBOS) ? "BEARISH_BOS" : "CLOSE_BELOW_MA";
-   string sellReason  = (useBOS && bullBOS) ? "BULLISH_BOS" : "CLOSE_ABOVE_MA";
-
-   //--- cancel pending orders when the trend is lost
-   if(InpCancelOnCloseAcrossMA)
-     {
-      if(buyBroken)
-         DeletePendingOrders(c, ORDER_TYPE_BUY_LIMIT, buyReason);
-      if(sellBroken)
-         DeletePendingOrders(c, ORDER_TYPE_SELL_LIMIT, sellReason);
-     }
-
-   //--- reset PHASE 1 when the trigger breaks
-   if(InpResetOnCloseAcrossMA)
-     {
-      if(c.buy.phase == PHASE_WAIT_PATTERN && buyBroken)
-        {
-         c.buy.phase = PHASE_WAIT_CROSS;
-         AddEvent(c, "BUY PHASE 1 reset (" + buyReason + ")");
-        }
-      if(c.sell.phase == PHASE_WAIT_PATTERN && sellBroken)
-        {
-         c.sell.phase = PHASE_WAIT_CROSS;
-         AddEvent(c, "SELL PHASE 1 reset (" + sellReason + ")");
-        }
-     }
-
-   //--- PHASE 1 triggers
-   bool   buyTrigger  = false;
-   bool   sellTrigger = false;
-   string trigName    = "";
-   switch(InpTrigger)
-     {
-      case TRIGGER_BOS:
-         buyTrigger  = bullBOS;
-         sellTrigger = bearBOS;
-         trigName    = "BOS";
-         break;
-      case TRIGGER_BOS_MA:
-         buyTrigger  = bullBOS && closedAboveMA;
-         sellTrigger = bearBOS && closedBelowMA;
-         trigName    = "BOS with MA";
-         break;
-      default:
-         //--- first close above (below) the MA coming from below (above)
-         buyTrigger  = rates[2].close < ma[2] && closedAboveMA;
-         sellTrigger = rates[2].close > ma[2] && closedBelowMA;
-         trigName    = "MA cross";
-         break;
-     }
-
-   if(BuysAllowed() && buyTrigger)
-     {
-      c.buy.phase     = PHASE_WAIT_PATTERN;
-      c.buy.crossTime = rates[1].time;
-      c.buy.orders    = 0;
-      AddEvent(c, "BUY PHASE 1 passed (" + trigName + ") - waiting for Rally-Base-Rally");
-      if(useBOS)
-         TradeBOSOrigin(rates, c, true, bullIdx);
-     }
-
-   if(SellsAllowed() && sellTrigger)
-     {
-      c.sell.phase     = PHASE_WAIT_PATTERN;
-      c.sell.crossTime = rates[1].time;
-      c.sell.orders    = 0;
-      AddEvent(c, "SELL PHASE 1 passed (" + trigName + ") - waiting for Drop-Base-Drop");
-      if(useBOS)
-         TradeBOSOrigin(rates, c, false, bearIdx);
-     }
-
-   //--- PHASE 2: pattern after the trigger
-   if(BuysAllowed() && c.buy.phase == PHASE_WAIT_PATTERN)
-      CheckPattern(rates, c, true, 1, false);
-   if(SellsAllowed() && c.sell.phase == PHASE_WAIT_PATTERN)
-      CheckPattern(rates, c, false, 1, false);
+   if(SellsAllowed())
+      StepDirection(c, rates, ma, false);
+   if(BuysAllowed())
+      StepDirection(c, rates, ma, true);
 
    if(InpLogCandles)
       LogCandle(c, rates[1], ma[1]);
@@ -512,13 +413,169 @@ bool ProcessTimeframe(TFContext &c)
   }
 
 //+------------------------------------------------------------------+
-//| RBR (isBuy) / DBD shape with leg2 at series index i:             |
+//| MA angle in degrees at series index i: atan(MA move over N       |
+//| candles / ATR). + = rising, - = falling, 45 = 1 ATR in N candles |
+//+------------------------------------------------------------------+
+double MAAngle(const double &ma[], int i, double atr)
+  {
+   if(atr <= 0.0)
+      return 0.0;
+   return MathArctan((ma[i] - ma[i + InpAngleBars]) / atr) * 180.0 / M_PI;
+  }
+
+//--- sells need a falling MA, buys a rising one, at least InpMinAngle steep
+bool AngleOk(double angle, bool isBuy)
+  {
+   return isBuy ? (angle > 0.0 && angle >= InpMinAngle)
+                : (angle < 0.0 && angle <= -InpMinAngle);
+  }
+
+//+------------------------------------------------------------------+
+//| One direction on a new candle:                                   |
+//|   1. a waiting pattern: PHASE 2 (close beyond base) -> trade,    |
+//|      or give up (close beyond the pattern, too many candles)     |
+//|   2. a new pattern crossing the MA -> PHASE 1 (replaces the old) |
+//|   isBuy = false: RBR under a falling MA -> sell                  |
+//|   isBuy = true : DBD above a rising MA  -> buy                   |
+//+------------------------------------------------------------------+
+void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bool isBuy)
+  {
+   Watch w;
+   if(isBuy)
+      w = c.buy;
+   else
+      w = c.sell;
+
+   string   side    = isBuy ? "BUY" : "SELL";
+   string   pattern = isBuy ? "DBD" : "RBR";
+   MqlRates bar     = rates[1];
+
+   //--- 1. pattern waiting for the close beyond its base
+   if(w.active)
+     {
+      w.bars++;
+      if(InpSLMode == SL_EXTREME_SINCE)
+         w.slRef = isBuy ? MathMin(w.slRef, bar.low) : MathMax(w.slRef, bar.high);
+
+      bool broke  = isBuy ? bar.close > w.breakLevel : bar.close < w.breakLevel;
+      bool beyond = isBuy ? bar.close < w.patLow : bar.close > w.patHigh;
+
+      if(broke)
+        {
+         AddEvent(c, side + " PHASE 2 passed: closed " + (isBuy ? "above " : "below ") + pattern + " base " +
+                  DoubleToString(w.breakLevel, _Digits) + " after " + (string)w.bars + " candle(s)");
+         OpenTrade(c, w, isBuy);
+         w.active = false;
+        }
+      else if(InpCancelBeyondPattern && beyond)
+        {
+         AddEvent(c, side + " setup dropped: closed " + (isBuy ? "below the DBD low" : "above the RBR high"));
+         LogSetup(c, w, isBuy, "DROPPED_CLOSE_BEYOND_PATTERN", 0.0, 0.0, 0.0, 0.0);
+         w.active = false;
+        }
+      else if(InpMaxWaitBars > 0 && w.bars >= InpMaxWaitBars)
+        {
+         AddEvent(c, side + " setup dropped: no PHASE 2 after " + (string)w.bars + " candles");
+         LogSetup(c, w, isBuy, "DROPPED_EXPIRED", 0.0, 0.0, 0.0, 0.0);
+         w.active = false;
+        }
+     }
+
+   //--- 2. new pattern crossing the MA against its slope
+   Watch nw;
+   ZeroMemory(nw);
+   if(FindPhase1(c, rates, ma, isBuy, nw))
+     {
+      if(w.active)
+         LogSetup(c, w, isBuy, "REPLACED_BY_NEWER", 0.0, 0.0, 0.0, 0.0);
+      w = nw;
+      AddEvent(c, side + " PHASE 1 passed: " + pattern + " crossed the " + (isBuy ? "rising" : "falling") +
+               " MA (angle " + DoubleToString(w.angle, 1) + " deg) - waiting for a close " +
+               (isBuy ? "above " : "below ") + DoubleToString(w.breakLevel, _Digits));
+      LogSetup(c, w, isBuy, "PHASE1", 0.0, 0.0, 0.0, 0.0);
+      if(InpDrawZones && (InpDrawAllTFZones || c.tf == Period()))
+         DrawZone(c, isBuy, w);
+     }
+
+   if(isBuy)
+      c.buy = w;
+   else
+      c.sell = w;
+  }
+
+//+------------------------------------------------------------------+
+//| PHASE 1 on the last three closed candles.                        |
+//|   sell: RBR (bull, bear, bull) that started below a falling MA   |
+//|         and crossed above it                                     |
+//|   buy : DBD (bear, bull, bear) that started above a rising MA    |
+//|         and crossed below it                                     |
+//+------------------------------------------------------------------+
+bool FindPhase1(const TFContext &c, const MqlRates &rates[], const double &ma[], bool isBuy, Watch &w)
+  {
+   //--- MA must slope in the trade direction
+   if(!AngleOk(c.angle, isBuy))
+      return false;
+
+   //--- sells use a rally pattern (RBR), buys a drop pattern (DBD)
+   bool rally = !isBuy;
+   if(!IsPatternAt(rates, 1, rally))
+      return false;
+
+   MqlRates leg1 = rates[3];
+   MqlRates base = rates[2];
+   MqlRates leg2 = rates[1];
+
+   //--- approaching the MA from the other side: first leg opens below (RBR) / above (DBD) the MA
+   if(rally ? leg1.open >= ma[3] : leg1.open <= ma[3])
+      return false;
+
+   //--- ... and crossing it
+   bool crossed;
+   if(InpCrossMode == CROSS_BY_CLOSE)
+      crossed = rally ? leg2.close > ma[1] : leg2.close < ma[1];
+   else
+     {
+      crossed = false;
+      for(int k = 1; k <= 3 && !crossed; k++)
+         crossed = rally ? rates[k].high > ma[k] : rates[k].low < ma[k];
+     }
+   if(!crossed)
+      return false;
+
+   double avgSize = AverageCandleSize(rates, 4, InpAvgSizePeriod);
+   double minLeg  = avgSize * InpAvgSizeMultiplier;
+   if(InpUseAvgSizeFilter && (CandleSize(leg1) <= minLeg || CandleSize(leg2) <= minLeg))
+      return false;
+
+   w.active     = true;
+   w.baseTime   = base.time;
+   w.crossTime  = leg2.time;
+   w.baseHigh   = base.high;
+   w.baseLow    = base.low;
+   w.patHigh    = MathMax(leg1.high, MathMax(base.high, leg2.high));
+   w.patLow     = MathMin(leg1.low, MathMin(base.low, leg2.low));
+   if(InpBreakLevel == BREAK_BASE_EXTREME)
+      w.breakLevel = rally ? base.low : base.high;
+   else
+      w.breakLevel = rally ? MathMin(base.open, base.close) : MathMax(base.open, base.close);
+   w.slRef      = rally ? w.patHigh : w.patLow;
+   w.ma         = ma[1];
+   w.angle      = c.angle;
+   w.bars       = 0;
+   w.leg1Size   = CandleSize(leg1);
+   w.baseSize   = CandleSize(base);
+   w.leg2Size   = CandleSize(leg2);
+   w.avgSize    = avgSize;
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| RBR (rally) / DBD shape with the last leg at series index i:     |
 //| leg1 = [i+2], base = [i+1], leg2 = [i], legs longer than base    |
 //+------------------------------------------------------------------+
-bool IsPatternAt(const MqlRates &rates[], int i, bool isBuy)
+bool IsPatternAt(const MqlRates &rates[], int i, bool rally)
   {
-   //--- RBR: bullish, bearish, bullish   DBD: bearish, bullish, bearish
-   if(isBuy)
+   if(rally)
      {
       if(!IsBullish(rates[i + 2]) || !IsBearish(rates[i + 1]) || !IsBullish(rates[i]))
          return false;
@@ -535,175 +592,63 @@ bool IsPatternAt(const MqlRates &rates[], int i, bool isBuy)
   }
 
 //+------------------------------------------------------------------+
-//| On a BOS: find the RBR/DBD that caused it - the most recent one  |
-//| between the broken swing and the BOS candle whose zone price has |
-//| not come back to since - and trade it.                           |
+//| PHASE 2 passed: market order on the open of the new candle       |
 //+------------------------------------------------------------------+
-void TradeBOSOrigin(const MqlRates &rates[], TFContext &c, bool isBuy, int swingIdx)
+void OpenTrade(TFContext &c, const Watch &w, bool isBuy)
   {
-   if(InpBOSSetup != BOS_SETUP_NEW)
-     {
-      for(int i = 1; i + 1 < swingIdx; i++)
-        {
-         if(!IsPatternAt(rates, i, isBuy))
-            continue;
-         //--- zone must be untouched after the pattern (fresh)
-         MqlRates base  = rates[i + 1];
-         bool     fresh = true;
-         for(int k = i - 1; k >= 1 && fresh; k--)
-            fresh = isBuy ? rates[k].low > MathMax(base.open, base.close)
-                          : rates[k].high < MathMin(base.open, base.close);
-         if(!fresh)
-            continue;
-         CheckPattern(rates, c, isBuy, i, true);
-         break;
-        }
-     }
+   double price   = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl      = NormalizePrice(isBuy ? w.slRef - InpSLBufferPoints * _Point
+                                         : w.slRef + InpSLBufferPoints * _Point);
+   double risk    = isBuy ? price - sl : sl - price;
+   double tp      = NormalizePrice(isBuy ? price + InpRewardRisk * risk : price - InpRewardRisk * risk);
+   double minDist = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   double lots    = 0.0;
+   ulong  ticket  = 0;
+   string result  = "";
 
-   //--- origin only: nothing more to wait for after this BOS
-   if(InpBOSSetup == BOS_SETUP_ORIGIN)
-     {
-      if(isBuy)
-         c.buy.phase = PHASE_WAIT_CROSS;
-      else
-         c.sell.phase = PHASE_WAIT_CROSS;
-     }
-  }
-
-//+------------------------------------------------------------------+
-//| PHASE 2: RBR/DBD with leg2 at series index i                     |
-//|   isBuy = true : Rally-Base-Rally -> buy limit                   |
-//|   isBuy = false: Drop-Base-Drop   -> sell limit                  |
-//|   origin = true: the pattern that caused the BOS (formed before  |
-//|                  the trigger candle, so no "after trigger" rule) |
-//+------------------------------------------------------------------+
-void CheckPattern(const MqlRates &rates[], TFContext &c, bool isBuy, int i, bool origin)
-  {
-   MqlRates leg1      = rates[i + 2];
-   MqlRates base      = rates[i + 1];
-   MqlRates leg2      = rates[i];
-   string   side      = isBuy ? "BUY" : "SELL";
-   string   pattern   = isBuy ? "RBR" : "DBD";
-   datetime crossTime = isBuy ? c.buy.crossTime : c.sell.crossTime;
-   int      setupNo   = (isBuy ? c.buy.orders : c.sell.orders) + 1;
-
-   //--- a new pattern must form after the trigger candle
-   if(!origin && (InpAllowCrossAsLeg ? (leg1.time < crossTime) : (leg1.time <= crossTime)))
-      return;
-
-   if(!IsPatternAt(rates, i, isBuy))
-      return;
-
-   double leg1Size = CandleSize(leg1);
-   double baseSize = CandleSize(base);
-   double leg2Size = CandleSize(leg2);
-
-   double avgSize = AverageCandleSize(rates, i + 3, InpAvgSizePeriod);
-   double minLeg  = avgSize * InpAvgSizeMultiplier;
-
-   //--- zone = base candle body. Near edge (base open) is the edge closest to price:
-   //--- RBR base is bearish -> open is the top; DBD base is bullish -> open is the bottom
-   double nearEdge   = base.open;
-   double farEdge    = base.close;
-   double zoneTop    = MathMax(nearEdge, farEdge);
-   double zoneBottom = MathMin(nearEdge, farEdge);
-   double entry;
-   switch(InpEntryLevel)
-     {
-      case ENTRY_ZONE_MID: entry = (nearEdge + farEdge) / 2.0; break;
-      case ENTRY_ZONE_FAR: entry = farEdge;                    break;
-      default:             entry = nearEdge;                   break;
-     }
-   double sl = isBuy ? base.low  - InpSLBufferPoints * _Point
-                     : base.high + InpSLBufferPoints * _Point;
-
-   entry = NormalizePrice(entry);
-   sl    = NormalizePrice(sl);
-   double risk = isBuy ? entry - sl : sl - entry;
-   double tp   = NormalizePrice(isBuy ? entry + InpRewardRisk * risk
-                                      : entry - InpRewardRisk * risk);
-
-   double ask       = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double minDist   = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-   double priceDist = isBuy ? ask - entry : entry - bid;
-   double tpDist    = isBuy ? tp - entry  : entry - tp;
-   double lots      = 0.0;
-   ulong  ticket    = 0;
-   string result    = "";
-
-   //--- legs must be bigger than the average candle: skips choppy, sideways markets
-   if(InpUseAvgSizeFilter && (leg1Size <= minLeg || leg2Size <= minLeg))
-      result = "SKIP_AVG_SIZE";
+   if(InpCheckAngleAtEntry && !AngleOk(c.angle, isBuy))
+      result = "SKIP_ANGLE_AT_ENTRY";
    else if(risk <= 0.0 || tp <= 0.0)
       result = "SKIP_BAD_RISK";
    else if(InpOneTradeAtATime && HasOpenTrade(c))
       result = "SKIP_TRADE_OPEN";
-   //--- only place the limit order if price has not reached the zone yet
-   else if(isBuy ? (ask <= entry) : (bid >= entry))
-      result = "SKIP_PRICE_IN_ZONE";
-   else if(priceDist < minDist || risk < minDist || tpDist < minDist)
+   else if(risk < minDist || InpRewardRisk * risk < minDist)
       result = "SKIP_STOPS_LEVEL";
    else
      {
-      lots = CalcLots(isBuy, entry, sl);
+      lots = CalcLots(isBuy, price, sl);
       if(lots <= 0.0)
          result = "SKIP_LOT_SIZE";
       else
         {
          string comment = InpComment + " " + c.name;
          g_trade.SetExpertMagicNumber(c.magic);
-         bool placed = isBuy ? g_trade.BuyLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment)
-                             : g_trade.SellLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
-         if(placed && g_trade.ResultOrder() > 0)
+         bool sent = isBuy ? g_trade.Buy(lots, _Symbol, 0.0, sl, tp, comment)
+                           : g_trade.Sell(lots, _Symbol, 0.0, sl, tp, comment);
+         uint retcode = g_trade.ResultRetcode();
+         if(sent && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED) && g_trade.ResultOrder() > 0)
            {
             ticket = g_trade.ResultOrder();
-            result = "PLACED";
+            result = "OPENED";
            }
          else
-            result = "FAILED_" + (string)g_trade.ResultRetcode();
+            result = "FAILED_" + (string)retcode;
         }
      }
 
-   if(result != "SKIP_AVG_SIZE" && InpDrawZones && (InpDrawAllTFZones || c.tf == Period()))
-      DrawZone(c, isBuy, base.time, zoneTop, zoneBottom, sl, tp);
-
-   AddEvent(c, side + " " + pattern + " zone " + DoubleToString(zoneBottom, _Digits) + "-" +
-            DoubleToString(zoneTop, _Digits) + " entry " + DoubleToString(entry, _Digits) +
-            (origin ? " (BOS origin, setup #" : " (setup #") + (string)setupNo + "): " + result);
-
-   if(InpLogSetups)
-      LogSetup(c, isBuy, base.time, leg1Size, baseSize, leg2Size, avgSize,
-               zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, origin, result);
+   AddEvent(c, (isBuy ? "BUY " : "SELL ") + DoubleToString(lots, LotDigits()) + " @ " + DoubleToString(price, _Digits) +
+            " SL " + DoubleToString(sl, _Digits) + " TP " + DoubleToString(tp, _Digits) + ": " + result);
+   LogSetup(c, w, isBuy, result, price, sl, tp, lots);
 
    if(ticket > 0)
-     {
-      AddTradeRec(c, isBuy, ticket, base.time, zoneTop, zoneBottom, entry, sl, tp, lots, setupNo, origin);
-      //--- setup consumed: wait for the next trigger, unless more setups per trigger are allowed.
-      //--- BOS "both" mode: after the origin pattern, keep looking for a new one after the BOS
-      bool keepLooking = (origin && InpBOSSetup == BOS_SETUP_BOTH) ||
-                         (InpMultipleSetups && (InpMaxSetupsPerCross == 0 || setupNo < InpMaxSetupsPerCross));
-      if(isBuy)
-        {
-         c.buy.orders = setupNo;
-         if(!keepLooking)
-            c.buy.phase = PHASE_WAIT_CROSS;
-        }
-      else
-        {
-         c.sell.orders = setupNo;
-         if(!keepLooking)
-            c.sell.phase = PHASE_WAIT_CROSS;
-        }
-     }
+      AddTradeRec(c, isBuy, ticket, w, price, sl, tp, lots);
   }
 
 //+------------------------------------------------------------------+
 //| Trade tracking                                                   |
 //+------------------------------------------------------------------+
-void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime,
-                 double zoneTop, double zoneBottom, double entry, double sl, double tp, double lots, int setupNo,
-                 bool origin)
+void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, const Watch &w,
+                 double entry, double sl, double tp, double lots)
   {
    double loss = 0.0;
    if(!OrderCalcProfit(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, entry, sl, loss))
@@ -715,11 +660,11 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime
    g_recs[n].slot         = c.slot;
    g_recs[n].isBuy        = isBuy;
    g_recs[n].state        = REC_PENDING;
-   g_recs[n].baseTime     = baseTime;
+   g_recs[n].baseTime     = w.baseTime;
    g_recs[n].placedTime   = TimeCurrent();
    g_recs[n].fillTime     = 0;
-   g_recs[n].zoneTop      = zoneTop;
-   g_recs[n].zoneBottom   = zoneBottom;
+   g_recs[n].zoneTop      = w.baseHigh;
+   g_recs[n].zoneBottom   = w.baseLow;
    g_recs[n].entry        = entry;
    g_recs[n].sl           = sl;
    g_recs[n].tp           = tp;
@@ -728,8 +673,9 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, datetime baseTime
    g_recs[n].fillPrice    = 0.0;
    g_recs[n].mfe          = 0.0;
    g_recs[n].mae          = 0.0;
-   g_recs[n].setupNo      = setupNo;
-   g_recs[n].origin       = origin;
+   g_recs[n].angle1       = w.angle;
+   g_recs[n].angle2       = c.angle;
+   g_recs[n].waitBars     = w.bars;
    g_recs[n].cancelReason = "";
   }
 
@@ -739,13 +685,6 @@ void RemoveRec(int i)
    for(int j = i; j < n - 1; j++)
       g_recs[j] = g_recs[j + 1];
    ArrayResize(g_recs, n - 1);
-  }
-
-void SetCancelReason(ulong ticket, const string reason)
-  {
-   for(int i = 0; i < ArraySize(g_recs); i++)
-      if(g_recs[i].ticket == ticket)
-         g_recs[i].cancelReason = reason;
   }
 
 //--- selects the position opened by the given order ticket
@@ -789,7 +728,7 @@ void UpdateTradeRecords()
             g_recs[i].state     = REC_OPEN;
             g_recs[i].fillTime  = (datetime)PositionGetInteger(POSITION_TIME);
             g_recs[i].fillPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            AddEvent(g_ctx[g_recs[i].slot], (g_recs[i].isBuy ? "BUY" : "SELL") + " limit " + (string)ticket +
+            AddEvent(g_ctx[g_recs[i].slot], (g_recs[i].isBuy ? "BUY" : "SELL") + " " + (string)ticket +
                      " filled @ " + DoubleToString(g_recs[i].fillPrice, _Digits));
            }
          else
@@ -958,45 +897,6 @@ bool HasOpenTrade(const TFContext &c)
    return CountOurPositions(magic) > 0 || CountOurPendingOrders(magic) > 0;
   }
 
-void DeletePendingOrders(TFContext &c, const ENUM_ORDER_TYPE type, const string reason)
-  {
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket == 0)
-         continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol ||
-         (ulong)OrderGetInteger(ORDER_MAGIC) != c.magic ||
-         (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != type)
-         continue;
-      SetCancelReason(ticket, reason);
-      if(g_trade.OrderDelete(ticket))
-         AddEvent(c, "pending " + (string)ticket + " cancelled: " + reason);
-     }
-  }
-
-void ManagePendingExpiry(TFContext &c)
-  {
-   if(InpExpiryBars <= 0)
-      return;
-   long maxAge = (long)InpExpiryBars * PeriodSeconds(c.tf);
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket == 0)
-         continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol ||
-         (ulong)OrderGetInteger(ORDER_MAGIC) != c.magic)
-         continue;
-      datetime setup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
-      if((long)(TimeCurrent() - setup) < maxAge)
-         continue;
-      string reason = "EXPIRED_" + (string)InpExpiryBars + "_BARS";
-      SetCancelReason(ticket, reason);
-      if(g_trade.OrderDelete(ticket))
-         AddEvent(c, "pending " + (string)ticket + " cancelled: " + reason);
-     }
-  }
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -1042,78 +942,20 @@ string TFName(ENUM_TIMEFRAMES tf)
 void ReleaseHandles()
   {
    for(int i = 0; i < ArraySize(g_ctx); i++)
+     {
       if(g_ctx[i].maHandle != INVALID_HANDLE)
         {
          IndicatorRelease(g_ctx[i].maHandle);
          g_ctx[i].maHandle = INVALID_HANDLE;
         }
-  }
-
-//+------------------------------------------------------------------+
-//| Break of structure                                               |
-//+------------------------------------------------------------------+
-//--- swing high (isHigh) / swing low at series index j: the extreme of N candles on each side
-bool IsSwing(const MqlRates &r[], int j, int n, bool isHigh)
-  {
-   for(int k = 1; k <= n; k++)
-     {
-      if(isHigh)
+      if(g_ctx[i].atrHandle != INVALID_HANDLE)
         {
-         if(r[j].high < r[j - k].high || r[j].high <= r[j + k].high)
-            return false;
-        }
-      else
-        {
-         if(r[j].low > r[j - k].low || r[j].low >= r[j + k].low)
-            return false;
+         IndicatorRelease(g_ctx[i].atrHandle);
+         g_ctx[i].atrHandle = INVALID_HANDLE;
         }
      }
-   return true;
   }
 
-bool BreaksLevel(const MqlRates &bar, double level, bool up)
-  {
-   if(InpBOSBreakByClose)
-      return up ? bar.close > level : bar.close < level;
-   return up ? bar.high > level : bar.low < level;
-  }
-
-//--- bullish BOS: the last closed candle [1] is the FIRST to break the most recent
-//--- confirmed swing high (confirmed by N candles before [1]). Bearish is the mirror.
-bool FindBOS(const MqlRates &r[], int count, bool bullish, double &level, datetime &swingTime, int &swingIdx)
-  {
-   int n    = InpSwingStrength;
-   int maxJ = MathMin(InpBOSLookback, count - n - 1);
-   for(int j = n + 2; j <= maxJ; j++)
-     {
-      if(!IsSwing(r, j, n, bullish))
-         continue;
-      level     = bullish ? r[j].high : r[j].low;
-      swingTime = r[j].time;
-      swingIdx  = j;
-      if(!BreaksLevel(r[1], level, bullish))
-         return false;
-      for(int k = 2; k < j; k++)
-         if(BreaksLevel(r[k], level, bullish))
-            return false;   // already broken earlier - not a new BOS
-      return true;
-     }
-   return false;
-  }
-
-void DrawBOS(const TFContext &c, bool bullish, datetime swingTime, datetime breakTime, double level)
-  {
-   string name = OBJ_PREFIX + c.name + "_BOS_" + (bullish ? "UP_" : "DN_") + TimeToString(breakTime, TIME_DATE | TIME_MINUTES);
-   ObjectDelete(0, name);
-   if(ObjectCreate(0, name, OBJ_TREND, 0, swingTime, level, breakTime, level))
-     {
-      ObjectSetInteger(0, name, OBJPROP_COLOR, bullish ? clrLimeGreen : clrRed);
-      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
-      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
-      ObjectSetString(0, name, OBJPROP_TOOLTIP, c.name + (bullish ? " bullish" : " bearish") + " BOS " +
-                      DoubleToString(level, _Digits));
-     }
-  }
 
 bool BuysAllowed()  { return InpDirection != DIR_SELL_ONLY; }
 bool SellsAllowed() { return InpDirection != DIR_BUY_ONLY;  }
@@ -1196,61 +1038,6 @@ void AddEvent(TFContext &c, const string text)
    Print(g_lastEvent);
   }
 
-void DrawZone(const TFContext &c, bool isBuy, datetime baseTime, double top, double bottom, double sl, double tp)
-  {
-   string   name = OBJ_PREFIX + c.name + "_" + (isBuy ? "RBR_" : "DBD_") + TimeToString(baseTime, TIME_DATE | TIME_MINUTES);
-   datetime t2   = baseTime + 30 * PeriodSeconds(c.tf);
-
-   ObjectDelete(0, name);
-   if(ObjectCreate(0, name, OBJ_RECTANGLE, 0, baseTime, top, t2, bottom))
-     {
-      ObjectSetInteger(0, name, OBJPROP_COLOR, isBuy ? clrDodgerBlue : clrOrangeRed);
-      ObjectSetInteger(0, name, OBJPROP_FILL, true);
-      ObjectSetInteger(0, name, OBJPROP_BACK, true);
-      ObjectSetString(0, name, OBJPROP_TOOLTIP,
-                      StringFormat("%s %s zone\nSL %s\nTP %s", c.name, isBuy ? "RBR demand" : "DBD supply",
-                                   DoubleToString(sl, _Digits), DoubleToString(tp, _Digits)));
-     }
-   ChartRedraw();
-  }
-
-string PhaseText(bool isBuy, const TFContext &c)
-  {
-   if(!(isBuy ? BuysAllowed() : SellsAllowed()))
-      return "off";
-   ENUM_PHASE phase = isBuy ? c.buy.phase : c.sell.phase;
-   datetime   cross = isBuy ? c.buy.crossTime : c.sell.crossTime;
-   if(phase == PHASE_WAIT_CROSS)
-      return InpTrigger == TRIGGER_MA_CROSS ? "wait cross" : (isBuy ? "wait bullish BOS" : "wait bearish BOS");
-   int orders = isBuy ? c.buy.orders : c.sell.orders;
-   return "wait " + (isBuy ? "RBR" : "DBD") + " (" + (InpTrigger == TRIGGER_MA_CROSS ? "cross " : "BOS ") + TimeToString(cross, TIME_DATE | TIME_MINUTES) +
-          (orders > 0 ? ", " + (string)orders + " placed" : "") + ")";
-  }
-
-string PhaseCode(bool isBuy, const TFContext &c)
-  {
-   if(!(isBuy ? BuysAllowed() : SellsAllowed()))
-      return "OFF";
-   ENUM_PHASE phase = isBuy ? c.buy.phase : c.sell.phase;
-   if(phase == PHASE_WAIT_CROSS)
-      return "WAIT_CROSS";
-   return isBuy ? "WAIT_RBR" : "WAIT_DBD";
-  }
-
-void UpdateComment()
-  {
-   if(!g_showComment)
-      return;
-   string s = StringFormat("RBR/DBD MA%d EA  |  %d timeframe(s)  |  closed trades %d  wins %d  net %.2f\n",
-                           InpMAPeriod, ArraySize(g_ctx), g_statTrades, g_statWins, g_statNet);
-   for(int i = 0; i < ArraySize(g_ctx); i++)
-      s += StringFormat("%-4s  BUY: %s   SELL: %s%s\n", g_ctx[i].name,
-                        PhaseText(true, g_ctx[i]), PhaseText(false, g_ctx[i]), g_ctx[i].status);
-   s += "Last: " + g_lastEvent;
-   if(g_logBase != "")
-      s += "\nLogs: " + g_logBase + "_*.csv";
-   Comment(s);
-  }
 
 //+------------------------------------------------------------------+
 //| CSV logging                                                      |
@@ -1334,6 +1121,66 @@ void FlushLogs()
    if(g_fhCandles != INVALID_HANDLE) FileFlush(g_fhCandles);
   }
 
+
+void DrawZone(const TFContext &c, bool isBuy, const Watch &w)
+  {
+   string   name = OBJ_PREFIX + c.name + "_" + (isBuy ? "DBD_" : "RBR_") + TimeToString(w.baseTime, TIME_DATE | TIME_MINUTES);
+   datetime t2   = w.baseTime + 30 * PeriodSeconds(c.tf);
+
+   ObjectDelete(0, name);
+   if(ObjectCreate(0, name, OBJ_RECTANGLE, 0, w.baseTime, w.baseHigh, t2, w.baseLow))
+     {
+      ObjectSetInteger(0, name, OBJPROP_COLOR, isBuy ? clrDodgerBlue : clrOrangeRed);
+      ObjectSetInteger(0, name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
+      ObjectSetString(0, name, OBJPROP_TOOLTIP,
+                      StringFormat("%s %s base\n%s on close %s %s\nSL ref %s\nMA angle %.1f deg", c.name,
+                                   isBuy ? "DBD" : "RBR", isBuy ? "BUY" : "SELL", isBuy ? "above" : "below",
+                                   DoubleToString(w.breakLevel, _Digits), DoubleToString(w.slRef, _Digits), w.angle));
+     }
+   ChartRedraw();
+  }
+
+string StateText(bool isBuy, const TFContext &c)
+  {
+   if(!(isBuy ? BuysAllowed() : SellsAllowed()))
+      return "off";
+   Watch w;
+   if(isBuy)
+      w = c.buy;
+   else
+      w = c.sell;
+   if(!w.active)
+      return isBuy ? "wait DBD" : "wait RBR";
+   return StringFormat("%s base, wait close %s %s (%d)", isBuy ? "DBD" : "RBR", isBuy ? ">" : "<",
+                       DoubleToString(w.breakLevel, _Digits), w.bars);
+  }
+
+string StateCode(bool isBuy, const TFContext &c)
+  {
+   if(!(isBuy ? BuysAllowed() : SellsAllowed()))
+      return "OFF";
+   bool active = isBuy ? c.buy.active : c.sell.active;
+   if(active)
+      return "WAIT_BREAK";
+   return isBuy ? "WAIT_DBD" : "WAIT_RBR";
+  }
+
+void UpdateComment()
+  {
+   if(!g_showComment)
+      return;
+   string s = StringFormat("MA%d rejection EA  |  %d timeframe(s)  |  closed trades %d  wins %d  net %.2f\n",
+                           InpMAPeriod, ArraySize(g_ctx), g_statTrades, g_statWins, g_statNet);
+   for(int i = 0; i < ArraySize(g_ctx); i++)
+      s += StringFormat("%-4s  angle %+6.1f deg  SELL: %s   BUY: %s%s\n", g_ctx[i].name, g_ctx[i].angle,
+                        StateText(false, g_ctx[i]), StateText(true, g_ctx[i]), g_ctx[i].status);
+   s += "Last: " + g_lastEvent;
+   if(g_logBase != "")
+      s += "\nLogs: " + g_logBase + "_*.csv";
+   Comment(s);
+  }
+
 //--- the inputs of this run, so results of different runs can be compared
 void WriteSettingsFile()
   {
@@ -1345,6 +1192,7 @@ void WriteSettingsFile()
    for(int i = 0; i < ArraySize(g_ctx); i++)
       tfs += (i > 0 ? " " : "") + g_ctx[i].name;
 
+   WriteLine(h, "strategy,MA_REJECTION_BASE_BREAK");
    WriteLine(h, "symbol," + _Symbol);
    WriteLine(h, "tester," + (string)g_isTester);
    WriteLine(h, "start_time," + Ts(TimeCurrent()));
@@ -1353,25 +1201,22 @@ void WriteSettingsFile()
    WriteLine(h, "ma_method," + EnumToString(InpMAMethod));
    WriteLine(h, "ma_price," + EnumToString(InpMAPrice));
    WriteLine(h, "direction," + EnumToString(InpDirection));
-   WriteLine(h, "trigger," + EnumToString(InpTrigger));
-   WriteLine(h, "swing_strength," + (string)InpSwingStrength);
-   WriteLine(h, "bos_lookback," + (string)InpBOSLookback);
-   WriteLine(h, "bos_break_by_close," + (string)InpBOSBreakByClose);
-   WriteLine(h, "bos_setup," + EnumToString(InpBOSSetup));
+   WriteLine(h, "angle_bars," + (string)InpAngleBars);
+   WriteLine(h, "angle_atr_period," + (string)InpAngleATRPeriod);
+   WriteLine(h, "min_angle," + DoubleToString(InpMinAngle, 1));
+   WriteLine(h, "check_angle_at_entry," + (string)InpCheckAngleAtEntry);
    WriteLine(h, "size_mode," + EnumToString(InpSizeMode));
    WriteLine(h, "both_legs_longer," + (string)InpBothLegsLonger);
-   WriteLine(h, "allow_cross_as_leg," + (string)InpAllowCrossAsLeg);
-   WriteLine(h, "reset_on_close_across_ma," + (string)InpResetOnCloseAcrossMA);
-   WriteLine(h, "multiple_setups," + (string)InpMultipleSetups);
-   WriteLine(h, "max_setups_per_cross," + (string)InpMaxSetupsPerCross);
+   WriteLine(h, "cross_mode," + EnumToString(InpCrossMode));
    WriteLine(h, "avg_size_filter," + (string)InpUseAvgSizeFilter);
    WriteLine(h, "avg_size_period," + (string)InpAvgSizePeriod);
    WriteLine(h, "avg_size_multiplier," + DoubleToString(InpAvgSizeMultiplier, 2));
-   WriteLine(h, "entry_level," + EnumToString(InpEntryLevel));
+   WriteLine(h, "break_level," + EnumToString(InpBreakLevel));
+   WriteLine(h, "max_wait_bars," + (string)InpMaxWaitBars);
+   WriteLine(h, "cancel_beyond_pattern," + (string)InpCancelBeyondPattern);
    WriteLine(h, "reward_risk," + DoubleToString(InpRewardRisk, 2));
+   WriteLine(h, "sl_mode," + EnumToString(InpSLMode));
    WriteLine(h, "sl_buffer_points," + (string)InpSLBufferPoints);
-   WriteLine(h, "expiry_bars," + (string)InpExpiryBars);
-   WriteLine(h, "cancel_on_close_across_ma," + (string)InpCancelOnCloseAcrossMA);
    WriteLine(h, "lot_mode," + EnumToString(InpLotMode));
    WriteLine(h, "fixed_lots," + DoubleToString(InpFixedLots, 2));
    WriteLine(h, "risk_percent," + DoubleToString(InpRiskPercent, 2));
@@ -1399,7 +1244,7 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
    string row = (string)r.ticket + "," +
                 g_ctx[r.slot].name + "," +
                 (r.isBuy ? "BUY" : "SELL") + "," +
-                (r.isBuy ? "RBR" : "DBD") + "," +
+                (r.isBuy ? "DBD" : "RBR") + "," +
                 Ts(r.baseTime) + "," +
                 Ts(r.placedTime) + "," +
                 Px(r.zoneTop) + "," +
@@ -1428,38 +1273,44 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
                 (filled && riskDist > 0.0 ? Rn(r.mae / riskDist) : "") + "," +
                 Mn(AccountInfoDouble(ACCOUNT_BALANCE)) + "," +
                 Mn(AccountInfoDouble(ACCOUNT_EQUITY)) + "," +
-                (string)r.setupNo + "," +
-                (r.origin ? "BOS_ORIGIN" : "AFTER_TRIGGER");
+                DoubleToString(r.angle1, 2) + "," +
+                DoubleToString(r.angle2, 2) + "," +
+                (string)r.waitBars;
    WriteLine(g_fhTrades, row);
    if(!g_isTester)
       FileFlush(g_fhTrades);
   }
 
-void LogSetup(const TFContext &c, bool isBuy, datetime baseTime, double leg1Size, double baseSize,
-              double leg2Size, double avgSize, double zoneTop, double zoneBottom,
-              double entry, double sl, double tp, double lots, int setupNo, bool origin, const string result)
+//--- one row per setup event: PHASE1, OPENED / SKIP_* / FAILED_*, DROPPED_*, REPLACED_BY_NEWER
+void LogSetup(const TFContext &c, const Watch &w, bool isBuy, const string result,
+              double entry, double sl, double tp, double lots)
   {
    if(g_fhSetups == INVALID_HANDLE)
       return;
    string row = Ts(TimeCurrent()) + "," +
                 c.name + "," +
                 (isBuy ? "BUY" : "SELL") + "," +
-                (isBuy ? "RBR" : "DBD") + "," +
-                Ts(baseTime) + "," +
-                Pts(leg1Size) + "," +
-                Pts(baseSize) + "," +
-                Pts(leg2Size) + "," +
-                Pts(avgSize) + "," +
-                Px(zoneTop) + "," +
-                Px(zoneBottom) + "," +
-                Px(entry) + "," +
-                Px(sl) + "," +
-                Px(tp) + "," +
-                DoubleToString(InpRewardRisk, 2) + "," +
-                (lots > 0.0 ? DoubleToString(lots, LotDigits()) : "") + "," +
+                (isBuy ? "DBD" : "RBR") + "," +
                 result + "," +
-                (string)setupNo + "," +
-                (origin ? "BOS_ORIGIN" : "AFTER_TRIGGER");
+                Ts(w.baseTime) + "," +
+                Px(w.baseHigh) + "," +
+                Px(w.baseLow) + "," +
+                Px(w.patHigh) + "," +
+                Px(w.patLow) + "," +
+                Px(w.breakLevel) + "," +
+                Px(w.slRef) + "," +
+                Px(w.ma) + "," +
+                DoubleToString(w.angle, 2) + "," +
+                DoubleToString(c.angle, 2) + "," +
+                (string)w.bars + "," +
+                Pts(w.leg1Size) + "," +
+                Pts(w.baseSize) + "," +
+                Pts(w.leg2Size) + "," +
+                Pts(w.avgSize) + "," +
+                (entry > 0.0 ? Px(entry) : "") + "," +
+                (sl > 0.0 ? Px(sl) : "") + "," +
+                (tp > 0.0 ? Px(tp) : "") + "," +
+                (lots > 0.0 ? DoubleToString(lots, LotDigits()) : "");
    WriteLine(g_fhSetups, row);
   }
 
@@ -1468,9 +1319,8 @@ void LogCandle(const TFContext &c, const MqlRates &bar, double ma)
    if(g_fhCandles == INVALID_HANDLE)
       return;
 
-   //--- trades of this timeframe: counts, floating P/L and details of the first open one
+   //--- trades of this timeframe: count, floating P/L and details of the first open one
    int    openCount = 0;
-   int    pendCount = 0;
    double floating  = 0.0;
    string tTicket = "", tDir = "", tEntry = "", tSL = "", tTP = "", tRNow = "", tMfe = "", tMae = "";
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1478,13 +1328,8 @@ void LogCandle(const TFContext &c, const MqlRates &bar, double ma)
 
    for(int i = 0; i < ArraySize(g_recs); i++)
      {
-      if(g_recs[i].slot != c.slot)
+      if(g_recs[i].slot != c.slot || g_recs[i].state != REC_OPEN)
          continue;
-      if(g_recs[i].state == REC_PENDING)
-        {
-         pendCount++;
-         continue;
-        }
       if(!SelectPositionById(g_recs[i].ticket))
          continue;
       openCount++;
@@ -1516,12 +1361,12 @@ void LogCandle(const TFContext &c, const MqlRates &bar, double ma)
                 Px(bar.close) + "," +
                 Px(ma) + "," +
                 (bar.close > ma ? "ABOVE" : (bar.close < ma ? "BELOW" : "ON")) + "," +
-                PhaseCode(true, c) + "," +
-                PhaseCode(false, c) + "," +
+                DoubleToString(c.angle, 2) + "," +
+                StateCode(true, c) + "," +
+                StateCode(false, c) + "," +
                 Mn(AccountInfoDouble(ACCOUNT_BALANCE)) + "," +
                 Mn(AccountInfoDouble(ACCOUNT_EQUITY)) + "," +
                 (string)openCount + "," +
-                (string)pendCount + "," +
                 Mn(floating) + "," +
                 tTicket + "," +
                 tDir + "," +

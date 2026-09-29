@@ -48,6 +48,16 @@ def num(v, default=0.0):
         return default
 
 
+ANGLE_BUCKETS = ["0-10", "10-20", "20-30", "30-45", "45-60", "60+"]
+
+
+def angle_bucket(a):
+    for limit, name in ((10, "0-10"), (20, "10-20"), (30, "20-30"), (45, "30-45"), (60, "45-60")):
+        if a < limit:
+            return name
+    return "60+"
+
+
 def tf_key(tf):
     return TF_ORDER.index(tf) if tf in TF_ORDER else len(TF_ORDER)
 
@@ -112,7 +122,12 @@ def main():
     print("Run:", os.path.basename(base))
 
     settings = {r["key"]: r["value"] for r in read_csv(base + "_settings.csv")}
-    if settings:
+    if settings.get("strategy") == "MA_REJECTION_BASE_BREAK":
+        print("Settings: RR %s | timeframes %s | min MA angle %s deg over %s candles | cross %s | break %s | SL %s | %s"
+              % (settings.get("reward_risk"), settings.get("timeframes"), settings.get("min_angle"),
+                 settings.get("angle_bars"), settings.get("cross_mode"), settings.get("break_level"),
+                 settings.get("sl_mode"), settings.get("direction")))
+    elif settings:
         print("Settings: RR %s | entry %s | timeframes %s | avg filter %s x%s | %s"
               % (settings.get("reward_risk"), settings.get("entry_level"), settings.get("timeframes"),
                  settings.get("avg_size_filter"), settings.get("avg_size_multiplier"), settings.get("direction")))
@@ -141,28 +156,23 @@ def main():
         print_table("== Results by direction ==", head, stats_rows(by_dir))
         print_table("== Results by timeframe and direction ==", head, stats_rows(by_tf_dir))
 
-        #--- 1st order after the MA cross vs later ones (EA option "Keep looking for more setups")
-        if any(r.get("setup_no") not in (None, "", "1") for r in closed):
-            by_no = defaultdict(list)
+        #--- MA angle (trend strength) at PHASE 1 and at entry: which angles are worth trading
+        for col, title in (("angle_phase1", "MA angle at PHASE 1"), ("angle_entry", "MA angle at entry")):
+            if not any(r.get(col) not in (None, "") for r in closed):
+                continue
+            by_ang = defaultdict(list)
             for r in closed:
-                n = int(num(r.get("setup_no"), 1))
-                by_no["#%d" % n if n < 4 else "#4+"].append(r)
-            print_table("== Results by setup number after the MA cross ==", head, stats_rows(dict(sorted(by_no.items()))))
-
-        #--- BOS mode: the RBR/DBD that caused the BOS vs new ones formed after it
-        sources = {r.get("setup_source") for r in closed} - {None, ""}
-        if "BOS_ORIGIN" in sources:
-            by_src = defaultdict(list)
-            for r in closed:
-                by_src[r.get("setup_source") or "AFTER_TRIGGER"].append(r)
-            print_table("== Results by setup source (BOS_ORIGIN = caused the BOS) ==", head, stats_rows(by_src))
+                by_ang[angle_bucket(abs(num(r.get(col))))].append(r)
+            rows = stats_rows(dict(sorted(by_ang.items(), key=lambda kv: ANGLE_BUCKETS.index(kv[0]))))
+            print_table("== Results by %s (degrees, either direction) ==" % title, head, rows)
 
     #--- fill rate: how many limit orders were never reached
     fills = defaultdict(Counter)
     for r in trades:
         fills[r["timeframe"]]["filled" if r["fill_time"] else "not filled"] += 1
     rows = []
-    for tf in sorted(fills, key=tf_key):
+    has_unfilled = any(c["not filled"] for c in fills.values())
+    for tf in sorted(fills, key=tf_key) if has_unfilled else []:
         c = fills[tf]
         total = c["filled"] + c["not filled"]
         rows.append([tf, total, c["filled"], "%.1f" % (100.0 * c["filled"] / total if total else 0)])
