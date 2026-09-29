@@ -1,20 +1,21 @@
 //+------------------------------------------------------------------+
 //|                                                RBR_MA200_EA.mq5  |
-//|  MA200 rejection + RBR/DBD base break, market entry.             |
+//|  MA200 rejection: strong candle crossing the MA, market entry   |
+//|  when a later candle closes back beyond it.                      |
 //|                                                                  |
 //|  SELL (MA200 heading down)                                       |
-//|  PHASE 1: a Rally-Base-Rally approaches the falling MA from      |
-//|           below and crosses it (last rally closes above the MA). |
-//|  PHASE 2: a candle closes below the RBR base.                    |
+//|  PHASE 1: a candle opens below the MA and closes above it with a |
+//|           significant body (the "cross candle").                 |
+//|  PHASE 2: a later candle closes below the cross candle's low.    |
 //|  ENTRY  : sell at market on the open of the next candle,         |
-//|           SL above the RBR high, TP = Reward:Risk (5 default).   |
+//|           SL above the cross candle high, TP = Reward:Risk (5).  |
 //|                                                                  |
 //|  BUY (MA200 heading up) - the mirror image                       |
-//|  PHASE 1: a Drop-Base-Drop approaches the rising MA from above   |
-//|           and crosses it (last drop closes below the MA).        |
-//|  PHASE 2: a candle closes above the DBD base.                    |
+//|  PHASE 1: a candle opens above the MA and closes below it with a |
+//|           significant body.                                      |
+//|  PHASE 2: a later candle closes above the cross candle's high.   |
 //|  ENTRY  : buy at market on the open of the next candle,          |
-//|           SL below the DBD low, TP = Reward:Risk.                |
+//|           SL below the cross candle low, TP = Reward:Risk.       |
 //|                                                                  |
 //|  MA angle: atan( MA move over N candles / ATR ) in degrees.      |
 //|  45 deg = the MA moved one ATR in N candles, on any symbol and   |
@@ -24,8 +25,8 @@
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "3.00"
-#property description "MA200 rejection: RBR/DBD crossing the MA against its slope, market entry on the close beyond the base"
+#property version   "3.10"
+#property description "MA200 rejection: strong candle crossing the MA against its slope, market entry when a later candle closes back beyond it"
 
 #include <Trade/Trade.mqh>
 
@@ -34,28 +35,16 @@
 #define REC_OPEN    1
 
 //--- enums
-enum ENUM_CANDLE_SIZE
-  {
-   SIZE_BODY  = 0, // Body (open to close)
-   SIZE_RANGE = 1  // Full range (high to low)
-  };
-
-enum ENUM_CROSS_MODE
-  {
-   CROSS_BY_CLOSE = 0, // Last rally/drop closes beyond the MA
-   CROSS_BY_WICK  = 1  // Any wick of the pattern crosses the MA
-  };
-
 enum ENUM_BREAK_LEVEL
   {
-   BREAK_BASE_EXTREME = 0, // Base low (sell) / base high (buy)
-   BREAK_BASE_BODY    = 1  // Base body bottom (sell) / body top (buy)
+   BREAK_CROSS_EXTREME = 0, // Cross candle low (sell) / high (buy)
+   BREAK_CROSS_OPEN    = 1  // Cross candle open (sell and buy)
   };
 
 enum ENUM_SL_MODE
   {
-   SL_PATTERN_EXTREME = 0, // RBR high (sell) / DBD low (buy)
-   SL_EXTREME_SINCE   = 1  // Highest high (sell) / lowest low (buy) since the pattern
+   SL_CROSS_EXTREME   = 0, // Cross candle high (sell) / low (buy)
+   SL_EXTREME_SINCE   = 1  // Highest high (sell) / lowest low (buy) since the cross candle
   };
 
 enum ENUM_LOT_MODE
@@ -66,9 +55,9 @@ enum ENUM_LOT_MODE
 
 enum ENUM_TRADE_DIRECTION
   {
-   DIR_BOTH      = 0, // Sell (RBR) and buy (DBD)
-   DIR_BUY_ONLY  = 1, // Buy only (DBD under a rising MA)
-   DIR_SELL_ONLY = 2  // Sell only (RBR under a falling MA)
+   DIR_BOTH      = 0, // Sell and buy
+   DIR_BUY_ONLY  = 1, // Buy only (cross down through a rising MA)
+   DIR_SELL_ONLY = 2  // Sell only (cross up through a falling MA)
   };
 
 enum ENUM_TRADE_SCOPE
@@ -77,25 +66,23 @@ enum ENUM_TRADE_SCOPE
    SCOPE_GLOBAL = 1  // Across all timeframes
   };
 
-//--- a pattern that passed PHASE 1 and waits for the close beyond its base (PHASE 2)
+//--- a cross candle that passed PHASE 1 and waits for the close back beyond it (PHASE 2)
 struct Watch
   {
    bool     active;
-   datetime baseTime;
-   datetime crossTime;    // candle that crossed the MA (last rally/drop)
-   double   baseHigh;
-   double   baseLow;
-   double   patHigh;      // highest high of the 3 pattern candles
-   double   patLow;       // lowest low of the 3 pattern candles
+   datetime crossTime;    // the cross candle
+   double   crossOpen;
+   double   crossHigh;
+   double   crossLow;
+   double   crossClose;
    double   breakLevel;   // PHASE 2 level: close beyond it triggers the trade
-   double   slRef;        // SL reference (pattern extreme, or extreme since the pattern)
+   double   slRef;        // SL reference (cross candle extreme, or extreme since)
    double   ma;           // MA at the cross candle
    double   angle;        // MA angle at PHASE 1 (degrees)
    int      bars;         // candles waited since PHASE 1
-   double   leg1Size;
-   double   baseSize;
-   double   leg2Size;
-   double   avgSize;
+   double   bodySize;     // cross candle body
+   double   rangeSize;    // cross candle high - low
+   double   avgSize;      // average body of the candles before it
   };
 
 //--- one enabled timeframe
@@ -110,8 +97,8 @@ struct TFContext
    int             atrHandle;
    datetime        lastBarTime;
    double          angle;       // MA angle on the last closed candle
-   Watch           sell;        // RBR under a falling MA
-   Watch           buy;         // DBD above a rising MA
+   Watch           sell;        // cross up through a falling MA
+   Watch           buy;         // cross down through a rising MA
    string          barEvents;   // events since the last candle log row
    string          status;
   };
@@ -123,11 +110,11 @@ struct TradeRec
    int      slot;         // g_ctx index of the timeframe that placed it
    bool     isBuy;
    int      state;        // REC_PENDING (sent) / REC_OPEN
-   datetime baseTime;
+   datetime crossTime;
    datetime placedTime;
    datetime fillTime;
-   double   zoneTop;      // pattern base high
-   double   zoneBottom;   // pattern base low
+   double   zoneTop;      // cross candle high
+   double   zoneBottom;   // cross candle low
    double   entry;        // price when the order was sent
    double   sl;
    double   tp;
@@ -179,22 +166,20 @@ input int                InpAngleATRPeriod    = 14;    // ATR period used to sca
 input double             InpMinAngle          = 0.0;   // Min MA angle in degrees (0 = any slope; 45 = MA moved 1 ATR in N candles)
 input bool               InpCheckAngleAtEntry = false; // Also require the min angle at PHASE 2 (entry)
 
-input group "PHASE 1: RBR (sell) / DBD (buy) crossing the MA against its slope"
-input ENUM_CANDLE_SIZE   InpSizeMode          = SIZE_BODY;      // Candle length measured by
-input bool               InpBothLegsLonger    = true;           // Both rallies/drops longer than base (false = either one)
-input ENUM_CROSS_MODE    InpCrossMode         = CROSS_BY_CLOSE; // Pattern crosses the MA when
-input bool               InpUseAvgSizeFilter  = true;           // Rallies/drops must be above average candle size
-input int                InpAvgSizePeriod     = 20;             // Candles used for the average (before the pattern)
-input double             InpAvgSizeMultiplier = 1.0;            // Rally/drop size must exceed average x this
+input group "PHASE 1: strong candle crossing the MA against its slope"
+input bool               InpUseAvgSizeFilter  = true;  // Body must be bigger than the average body
+input int                InpAvgSizePeriod     = 20;    // Candles used for the average (before the cross candle)
+input double             InpAvgSizeMultiplier = 1.0;   // Body must exceed average body x this
+input double             InpMinBodyPercent    = 50.0;  // Body must be at least this % of the candle range (0 = off)
 
-input group "PHASE 2: close beyond the base"
-input ENUM_BREAK_LEVEL   InpBreakLevel          = BREAK_BASE_EXTREME; // Candle must close beyond
+input group "PHASE 2: close back beyond the cross candle"
+input ENUM_BREAK_LEVEL   InpBreakLevel          = BREAK_CROSS_EXTREME; // Candle must close beyond
 input int                InpMaxWaitBars         = 30;                 // Give up after N candles without PHASE 2 (0 = never)
-input bool               InpCancelBeyondPattern = true;               // Give up if a candle closes beyond the RBR high / DBD low
+input bool               InpCancelBeyondPattern = true;               // Give up if a candle closes above the cross high (sell) / below its low (buy)
 
 input group "Order (market order on the open of the candle after PHASE 2)"
 input double             InpRewardRisk     = 5.0;                // Reward:Risk (TP = RR x risk)
-input ENUM_SL_MODE       InpSLMode         = SL_PATTERN_EXTREME; // Stop loss behind
+input ENUM_SL_MODE       InpSLMode         = SL_CROSS_EXTREME;   // Stop loss behind
 input int                InpSLBufferPoints = 0;                  // Extra SL buffer (points)
 
 input group "Money management"
@@ -207,8 +192,8 @@ input ulong              InpMagic           = 20020;         // Base magic numbe
 input int                InpSlippagePoints  = 10;            // Slippage (points)
 input bool               InpOneTradeAtATime = true;          // Skip new trades while a position exists
 input ENUM_TRADE_SCOPE   InpTradeScope      = SCOPE_PER_TF;  // One trade at a time applies
-input bool               InpDrawZones       = true;          // Draw pattern bases on chart
-input bool               InpDrawAllTFZones  = false;         // Draw bases of all timeframes (false = chart timeframe only)
+input bool               InpDrawZones       = true;          // Mark cross candles on chart
+input bool               InpDrawAllTFZones  = false;         // Mark cross candles of all timeframes (false = chart timeframe only)
 input string             InpComment         = "RBR_MA200";   // Order comment (timeframe is appended)
 
 input group "CSV logging (for analysis)"
@@ -242,18 +227,18 @@ bool            g_showComment = true;
 const string OBJ_PREFIX = "RBR_MA200_";
 const string LOG_FOLDER = "RBR_MA200_logs\\";
 
-const string TRADES_HEADER = "ticket,timeframe,direction,pattern,base_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,angle_phase1,angle_entry,bars_waited";
-const string SETUPS_HEADER = "time,timeframe,direction,pattern,result,base_time,base_high,base_low,pattern_high,pattern_low,break_level,sl_ref,ma,angle_phase1,angle_now,bars_waited,leg1_points,base_points,leg2_points,avg_points,entry,sl,tp,lots";
+const string TRADES_HEADER = "ticket,timeframe,direction,pattern,cross_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,angle_phase1,angle_entry,bars_waited";
+const string SETUPS_HEADER = "time,timeframe,direction,pattern,result,cross_time,cross_open,cross_high,cross_low,cross_close,break_level,sl_ref,ma,angle_phase1,angle_now,bars_waited,body_points,range_points,avg_body_points,body_pct,entry,sl,tp,lots";
 const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,ma_angle,buy_state,sell_state,balance,equity,tf_open_trades,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0 ||
-      InpAngleBars < 1 || InpAngleATRPeriod < 1 || InpMinAngle < 0.0 || InpMinAngle >= 90.0 || InpMaxWaitBars < 0)
+      InpMinBodyPercent < 0.0 || InpMinBodyPercent > 100.0 || InpAngleBars < 1 || InpAngleATRPeriod < 1 || InpMinAngle < 0.0 || InpMinAngle >= 90.0 || InpMaxWaitBars < 0)
      {
       Print("Invalid inputs: periods must be >= 1, Reward:Risk and average multiplier > 0, " +
-            "min angle 0..89, max wait bars >= 0");
+            "min body % 0..100, min angle 0..89, max wait bars >= 0");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -367,9 +352,9 @@ bool ProcessTimeframe(TFContext &c)
    if(barTime == 0 || barTime == c.lastBarTime)
       return false;
 
-   //--- closed candles: [1] = last closed, [2], [3] = before it,
-   //--- [4] .. [3 + InpAvgSizePeriod] = candles used for the average size
-   int barsNeeded = 4 + InpAvgSizePeriod;
+   //--- closed candles: [1] = last closed (possible cross candle),
+   //--- [2] .. [1 + InpAvgSizePeriod] = candles used for the average body
+   int barsNeeded = 2 + InpAvgSizePeriod;
    int maNeeded   = 4 + InpAngleBars;
 
    //--- not enough history for the MA on this timeframe (e.g. MN1 with MA200)
@@ -432,11 +417,11 @@ bool AngleOk(double angle, bool isBuy)
 
 //+------------------------------------------------------------------+
 //| One direction on a new candle:                                   |
-//|   1. a waiting pattern: PHASE 2 (close beyond base) -> trade,    |
-//|      or give up (close beyond the pattern, too many candles)     |
-//|   2. a new pattern crossing the MA -> PHASE 1 (replaces the old) |
-//|   isBuy = false: RBR under a falling MA -> sell                  |
-//|   isBuy = true : DBD above a rising MA  -> buy                   |
+//|   1. a waiting cross candle: PHASE 2 (close back beyond it) ->   |
+//|      trade, or give up (close beyond its far side, too long)     |
+//|   2. a new cross candle -> PHASE 1 (replaces the waiting one)    |
+//|   isBuy = false: candle crossing UP through a falling MA -> sell |
+//|   isBuy = true : candle crossing DOWN through a rising MA -> buy |
 //+------------------------------------------------------------------+
 void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bool isBuy)
   {
@@ -447,10 +432,9 @@ void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bo
       w = c.sell;
 
    string   side    = isBuy ? "BUY" : "SELL";
-   string   pattern = isBuy ? "DBD" : "RBR";
    MqlRates bar     = rates[1];
 
-   //--- 1. pattern waiting for the close beyond its base
+   //--- 1. cross candle waiting for the close back beyond it
    if(w.active)
      {
       w.bars++;
@@ -458,18 +442,18 @@ void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bo
          w.slRef = isBuy ? MathMin(w.slRef, bar.low) : MathMax(w.slRef, bar.high);
 
       bool broke  = isBuy ? bar.close > w.breakLevel : bar.close < w.breakLevel;
-      bool beyond = isBuy ? bar.close < w.patLow : bar.close > w.patHigh;
+      bool beyond = isBuy ? bar.close < w.crossLow : bar.close > w.crossHigh;
 
       if(broke)
         {
-         AddEvent(c, side + " PHASE 2 passed: closed " + (isBuy ? "above " : "below ") + pattern + " base " +
+         AddEvent(c, side + " PHASE 2 passed: closed " + (isBuy ? "above " : "below ") + "the cross candle at " +
                   DoubleToString(w.breakLevel, _Digits) + " after " + (string)w.bars + " candle(s)");
          OpenTrade(c, w, isBuy);
          w.active = false;
         }
       else if(InpCancelBeyondPattern && beyond)
         {
-         AddEvent(c, side + " setup dropped: closed " + (isBuy ? "below the DBD low" : "above the RBR high"));
+         AddEvent(c, side + " setup dropped: closed " + (isBuy ? "below the cross candle low" : "above the cross candle high"));
          LogSetup(c, w, isBuy, "DROPPED_CLOSE_BEYOND_PATTERN", 0.0, 0.0, 0.0, 0.0);
          w.active = false;
         }
@@ -481,7 +465,7 @@ void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bo
         }
      }
 
-   //--- 2. new pattern crossing the MA against its slope
+   //--- 2. new cross candle against the MA slope
    Watch nw;
    ZeroMemory(nw);
    if(FindPhase1(c, rates, ma, isBuy, nw))
@@ -489,7 +473,7 @@ void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bo
       if(w.active)
          LogSetup(c, w, isBuy, "REPLACED_BY_NEWER", 0.0, 0.0, 0.0, 0.0);
       w = nw;
-      AddEvent(c, side + " PHASE 1 passed: " + pattern + " crossed the " + (isBuy ? "rising" : "falling") +
+      AddEvent(c, side + " PHASE 1 passed: candle crossed " + (isBuy ? "down through the rising" : "up through the falling") +
                " MA (angle " + DoubleToString(w.angle, 1) + " deg) - waiting for a close " +
                (isBuy ? "above " : "below ") + DoubleToString(w.breakLevel, _Digits));
       LogSetup(c, w, isBuy, "PHASE1", 0.0, 0.0, 0.0, 0.0);
@@ -504,11 +488,11 @@ void StepDirection(TFContext &c, const MqlRates &rates[], const double &ma[], bo
   }
 
 //+------------------------------------------------------------------+
-//| PHASE 1 on the last three closed candles.                        |
-//|   sell: RBR (bull, bear, bull) that started below a falling MA   |
-//|         and crossed above it                                     |
-//|   buy : DBD (bear, bull, bear) that started above a rising MA    |
-//|         and crossed below it                                     |
+//| PHASE 1 on the last closed candle ("cross candle").              |
+//|   sell: opens below a falling MA, closes above it (bullish)      |
+//|   buy : opens above a rising MA, closes below it (bearish)       |
+//|   with a significant body: bigger than the average body and a    |
+//|   minimum share of the candle's range                            |
 //+------------------------------------------------------------------+
 bool FindPhase1(const TFContext &c, const MqlRates &rates[], const double &ma[], bool isBuy, Watch &w)
   {
@@ -516,79 +500,38 @@ bool FindPhase1(const TFContext &c, const MqlRates &rates[], const double &ma[],
    if(!AngleOk(c.angle, isBuy))
       return false;
 
-   //--- sells use a rally pattern (RBR), buys a drop pattern (DBD)
-   bool rally = !isBuy;
-   if(!IsPatternAt(rates, 1, rally))
+   MqlRates bar = rates[1];
+
+   //--- crossing against the slope: up through a falling MA (sell), down through a rising MA (buy)
+   if(isBuy ? !(bar.open > ma[1] && bar.close < ma[1]) : !(bar.open < ma[1] && bar.close > ma[1]))
       return false;
 
-   MqlRates leg1 = rates[3];
-   MqlRates base = rates[2];
-   MqlRates leg2 = rates[1];
-
-   //--- approaching the MA from the other side: first leg opens below (RBR) / above (DBD) the MA
-   if(rally ? leg1.open >= ma[3] : leg1.open <= ma[3])
+   double body    = MathAbs(bar.close - bar.open);
+   double range   = bar.high - bar.low;
+   double avgSize = AverageCandleSize(rates, 2, InpAvgSizePeriod);
+   if(InpUseAvgSizeFilter && body <= avgSize * InpAvgSizeMultiplier)
       return false;
-
-   //--- ... and crossing it
-   bool crossed;
-   if(InpCrossMode == CROSS_BY_CLOSE)
-      crossed = rally ? leg2.close > ma[1] : leg2.close < ma[1];
-   else
-     {
-      crossed = false;
-      for(int k = 1; k <= 3 && !crossed; k++)
-         crossed = rally ? rates[k].high > ma[k] : rates[k].low < ma[k];
-     }
-   if(!crossed)
-      return false;
-
-   double avgSize = AverageCandleSize(rates, 4, InpAvgSizePeriod);
-   double minLeg  = avgSize * InpAvgSizeMultiplier;
-   if(InpUseAvgSizeFilter && (CandleSize(leg1) <= minLeg || CandleSize(leg2) <= minLeg))
+   if(InpMinBodyPercent > 0.0 && (range <= 0.0 || body < range * InpMinBodyPercent / 100.0))
       return false;
 
    w.active     = true;
-   w.baseTime   = base.time;
-   w.crossTime  = leg2.time;
-   w.baseHigh   = base.high;
-   w.baseLow    = base.low;
-   w.patHigh    = MathMax(leg1.high, MathMax(base.high, leg2.high));
-   w.patLow     = MathMin(leg1.low, MathMin(base.low, leg2.low));
-   if(InpBreakLevel == BREAK_BASE_EXTREME)
-      w.breakLevel = rally ? base.low : base.high;
+   w.crossTime  = bar.time;
+   w.crossOpen  = bar.open;
+   w.crossHigh  = bar.high;
+   w.crossLow   = bar.low;
+   w.crossClose = bar.close;
+   if(InpBreakLevel == BREAK_CROSS_EXTREME)
+      w.breakLevel = isBuy ? bar.high : bar.low;
    else
-      w.breakLevel = rally ? MathMin(base.open, base.close) : MathMax(base.open, base.close);
-   w.slRef      = rally ? w.patHigh : w.patLow;
+      w.breakLevel = bar.open;
+   w.slRef      = isBuy ? bar.low : bar.high;
    w.ma         = ma[1];
    w.angle      = c.angle;
    w.bars       = 0;
-   w.leg1Size   = CandleSize(leg1);
-   w.baseSize   = CandleSize(base);
-   w.leg2Size   = CandleSize(leg2);
+   w.bodySize   = body;
+   w.rangeSize  = range;
    w.avgSize    = avgSize;
    return true;
-  }
-
-//+------------------------------------------------------------------+
-//| RBR (rally) / DBD shape with the last leg at series index i:     |
-//| leg1 = [i+2], base = [i+1], leg2 = [i], legs longer than base    |
-//+------------------------------------------------------------------+
-bool IsPatternAt(const MqlRates &rates[], int i, bool rally)
-  {
-   if(rally)
-     {
-      if(!IsBullish(rates[i + 2]) || !IsBearish(rates[i + 1]) || !IsBullish(rates[i]))
-         return false;
-     }
-   else
-     {
-      if(!IsBearish(rates[i + 2]) || !IsBullish(rates[i + 1]) || !IsBearish(rates[i]))
-         return false;
-     }
-   double baseSize = CandleSize(rates[i + 1]);
-   bool   l1Longer = CandleSize(rates[i + 2]) > baseSize;
-   bool   l2Longer = CandleSize(rates[i]) > baseSize;
-   return InpBothLegsLonger ? (l1Longer && l2Longer) : (l1Longer || l2Longer);
   }
 
 //+------------------------------------------------------------------+
@@ -660,11 +603,11 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, const Watch &w,
    g_recs[n].slot         = c.slot;
    g_recs[n].isBuy        = isBuy;
    g_recs[n].state        = REC_PENDING;
-   g_recs[n].baseTime     = w.baseTime;
+   g_recs[n].crossTime    = w.crossTime;
    g_recs[n].placedTime   = TimeCurrent();
    g_recs[n].fillTime     = 0;
-   g_recs[n].zoneTop      = w.baseHigh;
-   g_recs[n].zoneBottom   = w.baseLow;
+   g_recs[n].zoneTop      = w.crossHigh;
+   g_recs[n].zoneBottom   = w.crossLow;
    g_recs[n].entry        = entry;
    g_recs[n].sl           = sl;
    g_recs[n].tp           = tp;
@@ -965,7 +908,7 @@ bool IsBearish(const MqlRates &r) { return r.close < r.open; }
 
 double CandleSize(const MqlRates &r)
   {
-   return (InpSizeMode == SIZE_BODY) ? MathAbs(r.close - r.open) : (r.high - r.low);
+   return MathAbs(r.close - r.open);
   }
 
 double AverageCandleSize(const MqlRates &rates[], int start, int count)
@@ -1124,18 +1067,18 @@ void FlushLogs()
 
 void DrawZone(const TFContext &c, bool isBuy, const Watch &w)
   {
-   string   name = OBJ_PREFIX + c.name + "_" + (isBuy ? "DBD_" : "RBR_") + TimeToString(w.baseTime, TIME_DATE | TIME_MINUTES);
-   datetime t2   = w.baseTime + 30 * PeriodSeconds(c.tf);
+   string   name = OBJ_PREFIX + c.name + "_X_" + (isBuy ? "DN_" : "UP_") + TimeToString(w.crossTime, TIME_DATE | TIME_MINUTES);
+   datetime t2   = w.crossTime + 30 * PeriodSeconds(c.tf);
 
    ObjectDelete(0, name);
-   if(ObjectCreate(0, name, OBJ_RECTANGLE, 0, w.baseTime, w.baseHigh, t2, w.baseLow))
+   if(ObjectCreate(0, name, OBJ_RECTANGLE, 0, w.crossTime, w.crossHigh, t2, w.crossLow))
      {
       ObjectSetInteger(0, name, OBJPROP_COLOR, isBuy ? clrDodgerBlue : clrOrangeRed);
-      ObjectSetInteger(0, name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, name, OBJPROP_FILL, false);
       ObjectSetInteger(0, name, OBJPROP_BACK, true);
       ObjectSetString(0, name, OBJPROP_TOOLTIP,
-                      StringFormat("%s %s base\n%s on close %s %s\nSL ref %s\nMA angle %.1f deg", c.name,
-                                   isBuy ? "DBD" : "RBR", isBuy ? "BUY" : "SELL", isBuy ? "above" : "below",
+                      StringFormat("%s cross candle\n%s on close %s %s\nSL ref %s\nMA angle %.1f deg", c.name,
+                                   isBuy ? "BUY" : "SELL", isBuy ? "above" : "below",
                                    DoubleToString(w.breakLevel, _Digits), DoubleToString(w.slRef, _Digits), w.angle));
      }
    ChartRedraw();
@@ -1151,8 +1094,8 @@ string StateText(bool isBuy, const TFContext &c)
    else
       w = c.sell;
    if(!w.active)
-      return isBuy ? "wait DBD" : "wait RBR";
-   return StringFormat("%s base, wait close %s %s (%d)", isBuy ? "DBD" : "RBR", isBuy ? ">" : "<",
+      return isBuy ? "wait cross down" : "wait cross up";
+   return StringFormat("%s, wait close %s %s (%d)", isBuy ? "crossed down" : "crossed up", isBuy ? ">" : "<",
                        DoubleToString(w.breakLevel, _Digits), w.bars);
   }
 
@@ -1163,7 +1106,7 @@ string StateCode(bool isBuy, const TFContext &c)
    bool active = isBuy ? c.buy.active : c.sell.active;
    if(active)
       return "WAIT_BREAK";
-   return isBuy ? "WAIT_DBD" : "WAIT_RBR";
+   return isBuy ? "WAIT_CROSS_DOWN" : "WAIT_CROSS_UP";
   }
 
 void UpdateComment()
@@ -1192,7 +1135,7 @@ void WriteSettingsFile()
    for(int i = 0; i < ArraySize(g_ctx); i++)
       tfs += (i > 0 ? " " : "") + g_ctx[i].name;
 
-   WriteLine(h, "strategy,MA_REJECTION_BASE_BREAK");
+   WriteLine(h, "strategy,MA_REJECTION_CROSS_CANDLE");
    WriteLine(h, "symbol," + _Symbol);
    WriteLine(h, "tester," + (string)g_isTester);
    WriteLine(h, "start_time," + Ts(TimeCurrent()));
@@ -1205,9 +1148,7 @@ void WriteSettingsFile()
    WriteLine(h, "angle_atr_period," + (string)InpAngleATRPeriod);
    WriteLine(h, "min_angle," + DoubleToString(InpMinAngle, 1));
    WriteLine(h, "check_angle_at_entry," + (string)InpCheckAngleAtEntry);
-   WriteLine(h, "size_mode," + EnumToString(InpSizeMode));
-   WriteLine(h, "both_legs_longer," + (string)InpBothLegsLonger);
-   WriteLine(h, "cross_mode," + EnumToString(InpCrossMode));
+   WriteLine(h, "min_body_percent," + DoubleToString(InpMinBodyPercent, 1));
    WriteLine(h, "avg_size_filter," + (string)InpUseAvgSizeFilter);
    WriteLine(h, "avg_size_period," + (string)InpAvgSizePeriod);
    WriteLine(h, "avg_size_multiplier," + DoubleToString(InpAvgSizeMultiplier, 2));
@@ -1244,8 +1185,8 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
    string row = (string)r.ticket + "," +
                 g_ctx[r.slot].name + "," +
                 (r.isBuy ? "BUY" : "SELL") + "," +
-                (r.isBuy ? "DBD" : "RBR") + "," +
-                Ts(r.baseTime) + "," +
+                (r.isBuy ? "CROSS_DOWN" : "CROSS_UP") + "," +
+                Ts(r.crossTime) + "," +
                 Ts(r.placedTime) + "," +
                 Px(r.zoneTop) + "," +
                 Px(r.zoneBottom) + "," +
@@ -1290,23 +1231,23 @@ void LogSetup(const TFContext &c, const Watch &w, bool isBuy, const string resul
    string row = Ts(TimeCurrent()) + "," +
                 c.name + "," +
                 (isBuy ? "BUY" : "SELL") + "," +
-                (isBuy ? "DBD" : "RBR") + "," +
+                (isBuy ? "CROSS_DOWN" : "CROSS_UP") + "," +
                 result + "," +
-                Ts(w.baseTime) + "," +
-                Px(w.baseHigh) + "," +
-                Px(w.baseLow) + "," +
-                Px(w.patHigh) + "," +
-                Px(w.patLow) + "," +
+                Ts(w.crossTime) + "," +
+                Px(w.crossOpen) + "," +
+                Px(w.crossHigh) + "," +
+                Px(w.crossLow) + "," +
+                Px(w.crossClose) + "," +
                 Px(w.breakLevel) + "," +
                 Px(w.slRef) + "," +
                 Px(w.ma) + "," +
                 DoubleToString(w.angle, 2) + "," +
                 DoubleToString(c.angle, 2) + "," +
                 (string)w.bars + "," +
-                Pts(w.leg1Size) + "," +
-                Pts(w.baseSize) + "," +
-                Pts(w.leg2Size) + "," +
+                Pts(w.bodySize) + "," +
+                Pts(w.rangeSize) + "," +
                 Pts(w.avgSize) + "," +
+                (w.rangeSize > 0.0 ? DoubleToString(100.0 * w.bodySize / w.rangeSize, 1) : "") + "," +
                 (entry > 0.0 ? Px(entry) : "") + "," +
                 (sl > 0.0 ? Px(sl) : "") + "," +
                 (tp > 0.0 ? Px(tp) : "") + "," +

@@ -1,27 +1,27 @@
 # Price-action
 
-MetaTrader 5 Expert Advisor: **MA200 rejection**. A Rally-Base-Rally that pushes up through a falling MA200 is sold
-when price closes back below its base; a Drop-Base-Drop that pushes down through a rising MA200 is bought when price
-closes back above its base.
+MetaTrader 5 Expert Advisor: **MA200 rejection**. A strong candle that crosses up through a falling MA200 is sold
+when a later candle closes back below it; a strong candle that crosses down through a rising MA200 is bought when a
+later candle closes back above it.
 
 File: [`Experts/RBR_MA200_EA.mq5`](Experts/RBR_MA200_EA.mq5)
 Log analysis: [`tools/analyze_logs.py`](tools/analyze_logs.py)
 
-## Strategy (v3)
+## Strategy (v3.1)
 
 | Step | SELL | BUY |
 |---|---|---|
 | Trend | MA200 heading **down** (MA angle below 0°, or steeper than *Min MA angle*) | MA200 heading **up** |
-| **PHASE 1** | A **Rally-Base-Rally** (bullish, bearish, bullish, both rallies longer than the base) starts below the MA and crosses it: the last rally closes above the MA | A **Drop-Base-Drop** starts above the MA and crosses it: the last drop closes below the MA |
-| Filter | Both rallies bigger than the average candle of the 20 candles before the pattern | Both drops bigger than the average candle |
-| **PHASE 2** | A candle **closes below the RBR base** (base low by default) | A candle **closes above the DBD base** (base high by default) |
+| **PHASE 1** | A **cross candle**: opens below the MA and closes above it | A cross candle: opens above the MA and closes below it |
+| Significant body | Body bigger than the average body of the 20 candles before it, and at least 50% of the candle's range | Same |
+| **PHASE 2** | A later candle **closes below the cross candle's low** | A later candle **closes above the cross candle's high** |
 | Entry | **Sell at market** on the open of the next candle | **Buy at market** on the open of the next candle |
-| Stop loss | Above the RBR high (highest high of its 3 candles) | Below the DBD low |
+| Stop loss | Above the cross candle high | Below the cross candle low |
 | Take profit | Reward:Risk × risk (1:5 default) | Reward:Risk × risk |
 
-While a pattern waits for PHASE 2, a newer pattern crossing the MA replaces it. A waiting pattern is dropped if a
-candle closes above the RBR high (below the DBD low), or after 30 candles without PHASE 2. Every enabled timeframe
-runs on its own, and sells and buys are tracked separately.
+While a cross candle waits for PHASE 2, a newer cross candle replaces it. A waiting setup is dropped if a candle
+closes above the cross candle high (below its low for buys), or after 30 candles without PHASE 2. Every enabled
+timeframe runs on its own, and sells and buys are tracked separately.
 
 ### MA angle
 
@@ -53,32 +53,30 @@ angle = atan( (MA now − MA N candles ago) / ATR ) in degrees       (N = 10, AT
 | Use ALL timeframes | false | Run on all 21 MT5 timeframes (M1 … MN1), ignoring the list |
 | M1 … MN1 | only M20 on | Tick each timeframe to trade. Each one has its own setups, trades and magic number |
 | MA period / method / price | 200 / SMA / Close | Trend MA |
-| Trade direction | Both | Both, sell only (RBR) or buy only (DBD) |
+| Trade direction | Both | Both, sell only or buy only |
 | Angle measured over N candles | 10 | MA move is measured from N candles ago to the last closed candle |
 | ATR period used to scale the angle | 14 | |
 | Min MA angle | 0 | 0 = any slope in the trade direction. 45 = MA moved at least 1 ATR in N candles |
 | Also require the min angle at entry | false | Check the angle again at PHASE 2 |
-| Candle length measured by | Body | Body (open–close) or full range (high–low) for the rally/drop > base comparison |
-| Both rallies/drops longer than base | true | `false` = only one needs to be longer |
-| Pattern crosses the MA when | Last rally/drop closes beyond the MA | Or: any wick of the 3 pattern candles crosses the MA |
-| Rallies/drops above average candle size | true | Sideways-market filter |
-| Average period / multiplier | 20 / 1.0 | |
-| PHASE 2: candle must close beyond | Base low (sell) / base high (buy) | Or the base body (easier to trigger) |
+| Body bigger than the average body | true | Significant-body filter 1 |
+| Average period / multiplier | 20 / 1.0 | Body must exceed the average body of the 20 candles before it × 1.0 |
+| Min body % of range | 50 | Significant-body filter 2: body at least 50% of high–low (0 = off) |
+| PHASE 2: candle must close beyond | Cross candle low (sell) / high (buy) | Or the cross candle's open (easier to trigger) |
 | Give up after N candles | 30 | 0 = wait forever for PHASE 2 |
-| Give up if a candle closes beyond the pattern | true | Close above the RBR high / below the DBD low drops the setup |
+| Give up if a candle closes beyond the cross candle | true | Close above its high (sell) / below its low (buy) drops the setup |
 | Reward:Risk | 5.0 | TP = entry ± 5 × (distance from entry to SL) |
-| Stop loss behind | RBR high / DBD low | Or the highest high / lowest low reached since the pattern |
+| Stop loss behind | Cross candle high (sell) / low (buy) | Or the highest high / lowest low reached since the cross candle |
 | SL buffer (points) | 0 | |
 | Lot mode | Fixed | Fixed lot or % of balance risked |
 | Fixed lots / Risk % | 0.10 / 1.0 | |
 | Base magic number | 20020 | Each timeframe uses base + its index: M1 = 20020, M20 = 20029, H1 = 20031, D1 = 20038, MN1 = 20040 |
 | One trade at a time | true | Skip a new entry while a position is open |
 | One trade at a time applies | Per timeframe | Per timeframe or across all timeframes |
-| Draw pattern bases / all timeframes | true / false | Draws each PHASE 1 base (red = RBR for sells, blue = DBD for buys) |
+| Mark cross candles / all timeframes | true / false | Outlines each PHASE 1 cross candle (red = sell setup, blue = buy setup) |
 | Log trades / setups / candles | true | Which CSV files to write (see below) |
 | Write to Common\Files | true | Put logs in `Terminal/Common/Files` so tester and live runs land in the same place |
 
-The chart shows the MA angle and the state of every enabled timeframe (waiting for a pattern, or the base level it
+The chart shows the MA angle and the state of every enabled timeframe (waiting for a cross candle, or the level it
 waits to be closed beyond), the closed trade count and the last event.
 
 ## CSV logs
@@ -90,8 +88,8 @@ Each run writes a new set of files named `RBR_<symbol>_[TEST_]<date>_<time>_<id>
 | File | One row per | Columns |
 |---|---|---|
 | `_settings.csv` | input | All inputs of the run |
-| `_trades.csv` | trade | Timeframe, direction, base, entry, SL, TP, target RR, lots, money at risk, exit reason (TP / SL / …), close time/price, bars held, profit, net, **R multiple**, **MFE R** / **MAE R** (best / worst move in R), balance, equity, **MA angle at PHASE 1 and at entry**, candles waited for PHASE 2 |
-| `_setups.csv` | setup event | PHASE1, then OPENED / SKIP_… / FAILED_… (at PHASE 2), DROPPED_CLOSE_BEYOND_PATTERN, DROPPED_EXPIRED or REPLACED_BY_NEWER, with base, pattern high/low, break level, MA, angles and leg sizes |
+| `_trades.csv` | trade | Timeframe, direction, cross candle high/low, entry, SL, TP, target RR, lots, money at risk, exit reason (TP / SL / …), close time/price, bars held, profit, net, **R multiple**, **MFE R** / **MAE R** (best / worst move in R), balance, equity, **MA angle at PHASE 1 and at entry**, candles waited for PHASE 2 |
+| `_setups.csv` | setup event | PHASE1, then OPENED / SKIP_… / FAILED_… (at PHASE 2), DROPPED_CLOSE_BEYOND_PATTERN, DROPPED_EXPIRED or REPLACED_BY_NEWER, with the cross candle's OHLC, break level, MA, angles, body size, average body and body % |
 | `_candles.csv` | closed candle per timeframe | OHLC, MA, MA angle, buy/sell state, balance, equity, open trade's entry, SL, TP, current R, MFE/MAE, and the events of that candle |
 
 ## Analysing the logs
@@ -120,6 +118,6 @@ To tune it:
   same symbol merge into one position (the EA prints a warning).
 - The EA starts with no setups when attached. It does not rebuild its state from history after a restart, and
   positions opened before a restart are not logged.
-- The previous strategy (MA cross + RBR/DBD buy/sell limit orders, v2.10) is in the git history at commit
-  `cc7bdf5`: `git show cc7bdf5:Experts/RBR_MA200_EA.mq5 > RBR_MA200_EA_v2.mq5`.
+- Earlier strategies are in the git history: MA cross + RBR/DBD limit orders (v2.10) at `cc7bdf5`, RBR/DBD
+  crossing the MA + base break (v3.00) at `4622e71`. E.g. `git show cc7bdf5:Experts/RBR_MA200_EA.mq5 > RBR_MA200_EA_v2.mq5`.
 - Test it in the Strategy Tester (visual mode) and on a demo account before going live.

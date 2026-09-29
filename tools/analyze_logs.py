@@ -122,11 +122,12 @@ def main():
     print("Run:", os.path.basename(base))
 
     settings = {r["key"]: r["value"] for r in read_csv(base + "_settings.csv")}
-    if settings.get("strategy") == "MA_REJECTION_BASE_BREAK":
-        print("Settings: RR %s | timeframes %s | min MA angle %s deg over %s candles | cross %s | break %s | SL %s | %s"
+    if settings.get("strategy") in ("MA_REJECTION_BASE_BREAK", "MA_REJECTION_CROSS_CANDLE"):
+        print("Settings: RR %s | timeframes %s | min MA angle %s deg over %s candles | body > avg x%s, >= %s%% of range"
+              " | break %s | SL %s | %s"
               % (settings.get("reward_risk"), settings.get("timeframes"), settings.get("min_angle"),
-                 settings.get("angle_bars"), settings.get("cross_mode"), settings.get("break_level"),
-                 settings.get("sl_mode"), settings.get("direction")))
+                 settings.get("angle_bars"), settings.get("avg_size_multiplier"), settings.get("min_body_percent"),
+                 settings.get("break_level"), settings.get("sl_mode"), settings.get("direction")))
     elif settings:
         print("Settings: RR %s | entry %s | timeframes %s | avg filter %s x%s | %s"
               % (settings.get("reward_risk"), settings.get("entry_level"), settings.get("timeframes"),
