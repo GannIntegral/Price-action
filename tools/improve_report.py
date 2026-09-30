@@ -12,12 +12,15 @@ exit rule would have helped:
   - stop size (quartiles of the stop distance)
   - cross candle body vs the average body, and body % of the candle range
   - break-even stop: move SL to entry once the trade is +X R (estimated from the candle log)
+  - MA angle: minimum-angle filters, with the angle measured over 5 / 10 / 20 / 50 candles
+    (recomputed from the MA and prices in the candle log, so no new tester runs are needed)
 
 With several runs, a change is only worth making if it helps in (almost) every run: a rule that only
 helps one symbol is most likely fitted to noise.
 """
 import csv
 import glob
+import math
 import os
 import sys
 from collections import defaultdict
@@ -27,6 +30,9 @@ DEFAULT_DIRS = [
     "~/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Files/RBR_MA200_logs",
 ]
 BE_LEVELS = [1.0, 1.5, 2.0, 3.0]
+ANGLE_MIN = [None, 0, 5, 10, 15, 20, 25, 30]
+ANGLE_BARS = [5, 10, 20, 50]
+ATR_PERIOD = 14
 
 
 def newest_trades_file():
@@ -77,12 +83,18 @@ def load_run(path):
         else:
             t["_body_x"] = t["_body_pct"] = None
 
-    #--- candle-by-candle path of every trade (R at each candle close, MFE so far)
+    #--- candle-by-candle path of every trade (R at each candle close, MFE so far),
+    #--- and per timeframe the candles with their MA (to recompute the MA angle)
     paths = defaultdict(list)
+    series = defaultdict(list)
     for c in read_csv(base + "_candles.csv"):
         if c.get("trade_ticket"):
             paths[c["trade_ticket"]].append((num(c.get("trade_r_now")), num(c.get("trade_mfe_r"))))
-    return {"name": run_name(path), "trades": trades, "paths": paths}
+        if c.get("ma"):
+            series[c.get("timeframe")].append((c.get("candle_time"), num(c.get("high")), num(c.get("low")),
+                                               num(c.get("close")), num(c.get("ma"))))
+    index = {tf: {row[0]: i for i, row in enumerate(rows)} for tf, rows in series.items()}
+    return {"name": run_name(path), "trades": trades, "paths": paths, "series": series, "index": index}
 
 
 def avg_r(rows):
@@ -209,6 +221,71 @@ def print_break_even(runs):
         print("   Estimate from candle closes: a wick back to entry is not seen, so real results are a little lower.")
 
 
+def trade_sign(t):
+    return 1.0 if t.get("direction") == "BUY" else -1.0
+
+
+def logged_angle(col):
+    """MA angle logged by the EA (10 candles), signed so that + = sloping in the trade's direction."""
+    def fn(t, run):
+        v = t.get(col)
+        return None if v in (None, "") else num(v) * trade_sign(t)
+    return fn
+
+
+def computed_angle(n):
+    """MA angle over n candles at the cross candle, recomputed from the candle log: atan(MA move / ATR14)."""
+    def fn(t, run):
+        tf = t.get("timeframe")
+        rows = run["series"].get(tf)
+        i = run["index"].get(tf, {}).get(t.get("cross_time") or t.get("base_time"))
+        if rows is None or i is None or i < max(n, ATR_PERIOD):
+            return None
+        tr = [max(rows[k][1] - rows[k][2], abs(rows[k][1] - rows[k - 1][3]), abs(rows[k][2] - rows[k - 1][3]))
+              for k in range(i - ATR_PERIOD + 1, i + 1)]
+        atr = sum(tr) / ATR_PERIOD
+        if atr <= 0:
+            return None
+        return math.degrees(math.atan((rows[i][4] - rows[i - n][4]) / atr)) * trade_sign(t)
+    return fn
+
+
+def print_angle_filter(title, runs, angle_fn):
+    print("\n== %s ==" % title)
+    names = [r["name"] for r in runs] + (["ALL"] if len(runs) > 1 else [])
+    width = 11
+    print("%-16s" % "min angle" + "".join("%*s" % (width + 2, n[:width]) for n in names) + "   (trades  avg R)  total R")
+    angles = [[(t, angle_fn(t, run)) for t in run["trades"]] for run in runs]
+    if not any(a is not None for per_run in angles for _, a in per_run):
+        print("   (no data: needs the candle log of the run)")
+        return
+    for lim in ANGLE_MIN:
+        cells = []
+        for per_run in angles:
+            cells.append([t for t, a in per_run if a is not None and (lim is None or a >= lim)])
+        if len(runs) > 1:
+            cells.append([t for c in cells for t in c])
+        total = sum(t["_r"] for t in cells[-1])
+        label = "any (no filter)" if lim is None else ">= %d deg" % lim
+        print("%-16s" % label + "".join("%*s" % (width + 2, fmt(c)) for c in cells) + "  %+8.1f" % total)
+
+
+def print_angle_section(runs):
+    print("\n#### MA angle (+ = MA sloping in the trade's direction; the EA needs > 0 at PHASE 1) ####")
+    print_angle_filter("Logged angle at PHASE 1 (10 candles)", runs, logged_angle("angle_phase1"))
+    print_angle_filter("Logged angle at entry (10 candles)", runs, logged_angle("angle_entry"))
+    for n in ANGLE_BARS:
+        print_angle_filter("Angle at PHASE 1 over %d candles (recomputed)" % n, runs, computed_angle(n))
+    #--- sanity check: the recomputed 10-candle angle should match what the EA logged
+    diffs = [abs(computed_angle(10)(t, run) - logged_angle("angle_phase1")(t, run))
+             for run in runs for t in run["trades"]
+             if computed_angle(10)(t, run) is not None and logged_angle("angle_phase1")(t, run) is not None]
+    if diffs:
+        print("\n   check: recomputed 10-candle angle vs EA's logged angle, mean difference %.2f deg over %d trades"
+              % (sum(diffs) / len(diffs), len(diffs)))
+    print("   A minimum angle is only worth using if avg R rises in every run AND total R does not fall much.")
+
+
 def main():
     files = sys.argv[1:] or [newest_trades_file()]
     runs = [load_run(f) for f in files]
@@ -222,6 +299,7 @@ def main():
     print_section("Cross candle body vs average body", runs, body_x_bucket, ["1.0-1.5x", "1.5-2x", "2-3x", "3x+"])
     print_section("Cross candle body % of its range", runs, body_pct_bucket, ["50-60%", "60-70%", "70-85%", "85-100%"])
     print_break_even(runs)
+    print_angle_section(runs)
     print("\nA group is worth filtering out only if it is clearly negative in every run, with enough trades.")
 
 
