@@ -128,6 +128,9 @@ def main():
               % (settings.get("reward_risk"), settings.get("timeframes"), settings.get("min_angle"),
                  settings.get("angle_bars"), settings.get("avg_size_multiplier"), settings.get("min_body_percent"),
                  settings.get("break_level"), settings.get("sl_mode"), settings.get("direction")))
+        if num(settings.get("break_even_r")) > 0:
+            print("Break-even: SL to entry at +%sR (offset %s points)"
+                  % (settings.get("break_even_r"), settings.get("break_even_offset_points")))
     elif settings:
         print("Settings: RR %s | entry %s | timeframes %s | avg filter %s x%s | %s"
               % (settings.get("reward_risk"), settings.get("entry_level"), settings.get("timeframes"),

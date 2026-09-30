@@ -25,7 +25,7 @@
 //|  its own magic number (base magic + timeframe index).            |
 //+------------------------------------------------------------------+
 #property copyright "GannIntegral"
-#property version   "3.10"
+#property version   "3.20"
 #property description "MA200 rejection: strong candle crossing the MA against its slope, market entry when a later candle closes back beyond it"
 
 #include <Trade/Trade.mqh>
@@ -126,6 +126,8 @@ struct TradeRec
    double   angle1;       // MA angle at PHASE 1
    double   angle2;       // MA angle at entry
    int      waitBars;     // candles between PHASE 1 and PHASE 2
+   bool     beMoved;      // SL already moved to break-even
+   datetime beLastTry;    // last failed break-even modify (retry throttle)
    string   cancelReason;
   };
 
@@ -182,6 +184,10 @@ input double             InpRewardRisk     = 5.0;                // Reward:Risk 
 input ENUM_SL_MODE       InpSLMode         = SL_CROSS_EXTREME;   // Stop loss behind
 input int                InpSLBufferPoints = 0;                  // Extra SL buffer (points)
 
+input group "Break-even"
+input double             InpBreakEvenR            = 0.0;        // Move SL to entry once the trade is +X R (0 = off)
+input int                InpBreakEvenOffsetPoints = 0;          // Lock in this many points beyond entry
+
 input group "Money management"
 input ENUM_LOT_MODE      InpLotMode     = LOT_FIXED; // Lot mode
 input double             InpFixedLots   = 0.10;      // Fixed lot size
@@ -227,7 +233,7 @@ bool            g_showComment = true;
 const string OBJ_PREFIX = "RBR_MA200_";
 const string LOG_FOLDER = "RBR_MA200_logs\\";
 
-const string TRADES_HEADER = "ticket,timeframe,direction,pattern,cross_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,angle_phase1,angle_entry,bars_waited";
+const string TRADES_HEADER = "ticket,timeframe,direction,pattern,cross_time,placed_time,zone_top,zone_bottom,entry,sl,tp,rr_target,risk_points,lots,risk_money,status,reason,fill_time,fill_price,close_time,close_price,bars_to_fill,bars_held,profit,commission,swap,net_profit,r_multiple,mfe_r,mae_r,balance,equity,angle_phase1,angle_entry,bars_waited,be_moved";
 const string SETUPS_HEADER = "time,timeframe,direction,pattern,result,cross_time,cross_open,cross_high,cross_low,cross_close,break_level,sl_ref,ma,angle_phase1,angle_now,bars_waited,body_points,range_points,avg_body_points,body_pct,entry,sl,tp,lots";
 const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,close,ma,vs_ma,ma_angle,buy_state,sell_state,balance,equity,tf_open_trades,tf_floating,trade_ticket,trade_dir,trade_entry,trade_sl,trade_tp,trade_r_now,trade_mfe_r,trade_mae_r,events";
 
@@ -235,10 +241,11 @@ const string CANDLES_HEADER = "log_time,timeframe,candle_time,open,high,low,clos
 int OnInit()
   {
    if(InpMAPeriod < 1 || InpRewardRisk <= 0.0 || InpAvgSizePeriod < 1 || InpAvgSizeMultiplier <= 0.0 ||
-      InpMinBodyPercent < 0.0 || InpMinBodyPercent > 100.0 || InpAngleBars < 1 || InpAngleATRPeriod < 1 || InpMinAngle < 0.0 || InpMinAngle >= 90.0 || InpMaxWaitBars < 0)
+      InpMinBodyPercent < 0.0 || InpMinBodyPercent > 100.0 || InpAngleBars < 1 || InpAngleATRPeriod < 1 || InpMinAngle < 0.0 || InpMinAngle >= 90.0 || InpMaxWaitBars < 0 ||
+      InpBreakEvenR < 0.0)
      {
       Print("Invalid inputs: periods must be >= 1, Reward:Risk and average multiplier > 0, " +
-            "min body % 0..100, min angle 0..89, max wait bars >= 0");
+            "min body % 0..100, min angle 0..89, max wait bars >= 0, break-even R >= 0");
       return INIT_PARAMETERS_INCORRECT;
      }
 
@@ -619,6 +626,8 @@ void AddTradeRec(const TFContext &c, bool isBuy, ulong ticket, const Watch &w,
    g_recs[n].angle1       = w.angle;
    g_recs[n].angle2       = c.angle;
    g_recs[n].waitBars     = w.bars;
+   g_recs[n].beMoved      = false;
+   g_recs[n].beLastTry    = 0;
    g_recs[n].cancelReason = "";
   }
 
@@ -696,11 +705,54 @@ void UpdateTradeRecords()
                g_recs[i].mfe = move;
             if(-move > g_recs[i].mae)
                g_recs[i].mae = -move;
+            if(InpBreakEvenR > 0.0 && !g_recs[i].beMoved)
+               TryBreakEven(i);
            }
          else
             FinalizeClosed(i);
         }
      }
+  }
+
+//--- break-even: once the trade is +InpBreakEvenR R, move the SL to entry (+ offset).
+//--- The position must be selected. A failed modify is retried at most every 10 seconds.
+void TryBreakEven(int i)
+  {
+   double riskDist = MathAbs(g_recs[i].entry - g_recs[i].sl);
+   if(riskDist <= 0.0 || g_recs[i].mfe < InpBreakEvenR * riskDist)
+      return;
+   if(g_recs[i].beLastTry > 0 && TimeCurrent() - g_recs[i].beLastTry < 10)
+      return;
+
+   bool   isBuy     = g_recs[i].isBuy;
+   ulong  posTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+   double curSL     = PositionGetDouble(POSITION_SL);
+   double tp        = PositionGetDouble(POSITION_TP);
+   double newSL     = NormalizePrice(isBuy ? g_recs[i].fillPrice + InpBreakEvenOffsetPoints * _Point
+                                           : g_recs[i].fillPrice - InpBreakEvenOffsetPoints * _Point);
+
+   //--- already at or beyond break-even
+   if(curSL > 0.0 && (isBuy ? curSL >= newSL : curSL <= newSL))
+     {
+      g_recs[i].beMoved = true;
+      return;
+     }
+
+   //--- the new SL must respect the broker's stops / freeze level
+   double price   = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   long   levelPt = MathMax(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+                            SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+   if(isBuy ? price - newSL <= levelPt * _Point : newSL - price <= levelPt * _Point)
+      return;   // price too close to entry right now, try again on a later tick
+
+   if(g_trade.PositionModify(posTicket, newSL, tp))
+     {
+      g_recs[i].beMoved = true;
+      AddEvent(g_ctx[g_recs[i].slot], (isBuy ? "BUY " : "SELL ") + (string)g_recs[i].ticket +
+               " SL moved to break-even " + DoubleToString(newSL, _Digits));
+     }
+   else
+      g_recs[i].beLastTry = TimeCurrent();
   }
 
 void FinalizeCancelled(int i, ENUM_ORDER_STATE st)
@@ -1158,6 +1210,8 @@ void WriteSettingsFile()
    WriteLine(h, "reward_risk," + DoubleToString(InpRewardRisk, 2));
    WriteLine(h, "sl_mode," + EnumToString(InpSLMode));
    WriteLine(h, "sl_buffer_points," + (string)InpSLBufferPoints);
+   WriteLine(h, "break_even_r," + DoubleToString(InpBreakEvenR, 2));
+   WriteLine(h, "break_even_offset_points," + (string)InpBreakEvenOffsetPoints);
    WriteLine(h, "lot_mode," + EnumToString(InpLotMode));
    WriteLine(h, "fixed_lots," + DoubleToString(InpFixedLots, 2));
    WriteLine(h, "risk_percent," + DoubleToString(InpRiskPercent, 2));
@@ -1216,7 +1270,8 @@ void WriteTradeRow(const TradeRec &r, const string status, datetime closeTime, d
                 Mn(AccountInfoDouble(ACCOUNT_EQUITY)) + "," +
                 DoubleToString(r.angle1, 2) + "," +
                 DoubleToString(r.angle2, 2) + "," +
-                (string)r.waitBars;
+                (string)r.waitBars + "," +
+                (r.beMoved ? "1" : "0");
    WriteLine(g_fhTrades, row);
    if(!g_isTester)
       FileFlush(g_fhTrades);

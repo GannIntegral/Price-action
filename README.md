@@ -67,6 +67,8 @@ angle = atan( (MA now − MA N candles ago) / ATR ) in degrees       (N = 10, AT
 | Reward:Risk | 5.0 | TP = entry ± 5 × (distance from entry to SL) |
 | Stop loss behind | Cross candle high (sell) / low (buy) | Or the highest high / lowest low reached since the cross candle |
 | SL buffer (points) | 0 | |
+| Break-even at +X R | 0 (off) | Once the trade is +X R (e.g. 1.0), the SL moves to the entry price |
+| Break-even offset (points) | 0 | Lock in this many points beyond entry when moving the SL |
 | Lot mode | Fixed | Fixed lot or % of balance risked |
 | Fixed lots / Risk % | 0.10 / 1.0 | |
 | Base magic number | 20020 | Each timeframe uses base + its index: M1 = 20020, M20 = 20029, H1 = 20031, D1 = 20038, MN1 = 20040 |
