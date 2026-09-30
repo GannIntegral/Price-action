@@ -127,6 +127,18 @@ candle body vs the average body, body % of range, and a **break-even stop** esti
 +1.5R, +2R, +3R, estimated from the candle log). A filter is only worth adding if the group it removes is clearly
 negative in every run, not just one.
 
+## Optimizer results (MA period, angle, ...)
+
+Run the MT5 optimizer with **Forward = 1/3**, export both result tabs (right-click → Export to XML) as
+`<SYMBOL>_opt.xml` (Optimization Results) and `<SYMBOL>_fwd.xml` (Forward Results) into one folder, then:
+
+```bash
+python3 tools/opt_report.py ~/opt_results
+```
+
+It prints per-symbol heat maps of the profit factor (tuning period and forward period) and ranks every input
+combination by its **worst forward profit factor across symbols**, marking the current setting (MA 200, angle 0).
+
 ## Notes
 
 - Several timeframes and both directions need a **hedging** account. On a netting account, trades on the
