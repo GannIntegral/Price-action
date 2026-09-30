@@ -128,6 +128,10 @@ def main():
               % (settings.get("reward_risk"), settings.get("timeframes"), settings.get("min_angle"),
                  settings.get("angle_bars"), settings.get("avg_size_multiplier"), settings.get("min_body_percent"),
                  settings.get("break_level"), settings.get("sl_mode"), settings.get("direction")))
+        if settings.get("avg_size_filter", "true").lower() != "true":
+            print("NOTE: 'Body must be bigger than the average body' is OFF - the body multiplier is not used")
+        if "break_even_r" not in settings:
+            print("NOTE: this run used an EA older than v3.20 (no break-even option) - sync and recompile the EA")
         if num(settings.get("break_even_r")) > 0:
             print("Break-even: SL to entry at +%sR (offset %s points)"
                   % (settings.get("break_even_r"), settings.get("break_even_offset_points")))
