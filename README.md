@@ -112,6 +112,19 @@ To tune it:
 3. Use the Reward:Risk table to pick the target (run with a high RR, e.g. 10, to measure bigger targets).
 4. Confirm the chosen settings on a different date range or symbol before trading live.
 
+## Looking for improvements
+
+```bash
+python3 tools/improve_report.py                                # newest run
+python3 tools/improve_report.py A_trades.csv B_trades.csv ...  # compare runs side by side
+```
+
+Uses the logs you already have (no new tester runs). For each idea it shows trades and average R per group, per run:
+first vs second half of the run (stability), candles waited from PHASE 1 to PHASE 2, stop size quartiles, cross
+candle body vs the average body, body % of range, and a **break-even stop** estimate (SL moved to entry at +1R,
++1.5R, +2R, +3R, estimated from the candle log). A filter is only worth adding if the group it removes is clearly
+negative in every run, not just one.
+
 ## Notes
 
 - Several timeframes and both directions need a **hedging** account. On a netting account, trades on the
